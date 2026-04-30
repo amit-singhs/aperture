@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#08090c">
+  <title>Aperture · Frame Intelligence</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+
+  <!-- hls.js for RTSP→HLS playback in the CCTV tab -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+</head>
+<body>
+
+<div class="grain"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6">
+        <circle cx="12" cy="12" r="9"/>
+        <circle cx="12" cy="12" r="3.5"/>
+        <line x1="12" y1="3" x2="12" y2="6"/>
+        <line x1="12" y1="18" x2="12" y2="21"/>
+        <line x1="3" y1="12" x2="6" y2="12"/>
+        <line x1="18" y1="12" x2="21" y2="12"/>
+      </svg>
+    </div>
+    <div class="brand-text">
+      <span class="brand-name">aperture</span>
+      <span class="brand-tag">frame intelligence</span>
+    </div>
+  </div>
+
+  <div class="topbar-status">
+    <div id="connStatus" class="pill pill-mute" data-state="idle">
+      <span class="pill-dot"></span>
+      <span class="pill-label">awaiting connection</span>
+    </div>
+  </div>
+</header>
+
+<main class="page">
+
+  <!-- HERO -->
+  <section class="hero">
+    <h1 class="hero-title">
+      See what your cameras see, <em>in&nbsp;words.</em>
+    </h1>
+    <p class="hero-sub">
+      Real-time scene understanding for any video source — files, your webcam, or live RTSP streams from CCTV.
+    </p>
+  </section>
+
+  <!-- CONNECTION CONFIG -->
+  <section class="config">
+    <button class="config-toggle" type="button" id="configToggle" aria-expanded="true" aria-controls="configBody">
+      <span class="config-label">backend connection</span>
+      <span class="config-chev" aria-hidden="true">▾</span>
+    </button>
+    <div class="config-body" id="configBody">
+      <div class="field">
+        <label for="apiUrl">API base URL</label>
+        <input type="text" id="apiUrl" autocomplete="off" spellcheck="false"
+               placeholder="https://your-tunnel.ngrok-free.dev">
+      </div>
+      <div class="field">
+        <label for="apiKey">API key</label>
+        <input type="password" id="apiKey" autocomplete="off" spellcheck="false"
+               placeholder="value of your API_KEY secret">
+      </div>
+      <div class="field-actions">
+        <button type="button" class="btn btn-primary" id="testConn">test connection</button>
+        <button type="button" class="btn btn-ghost" id="saveCreds" title="Save URL + key to this browser">remember</button>
+        <span id="connDetail" class="config-hint"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- WORK AREA: tabs + log -->
+  <section class="workspace">
+
+    <div class="panel panel-primary">
+      <!-- TABS -->
+      <nav class="tabs" role="tablist">
+        <button role="tab" id="tab-image" class="tab is-active" data-tab="image" aria-selected="true">
+          <span class="tab-num">01</span><span class="tab-label">image</span>
+        </button>
+        <button role="tab" id="tab-webcam" class="tab" data-tab="webcam" aria-selected="false">
+          <span class="tab-num">02</span><span class="tab-label">webcam</span>
+        </button>
+        <button role="tab" id="tab-cctv" class="tab" data-tab="cctv" aria-selected="false">
+          <span class="tab-num">03</span><span class="tab-label">cctv · rtsp</span>
+        </button>
+        <span class="tab-rail" id="tabRail"></span>
+      </nav>
+
+      <!-- TAB: IMAGE -->
+      <div class="tabpanel is-active" data-panel="image" role="tabpanel" aria-labelledby="tab-image">
+        <label class="dropzone" id="dropZone">
+          <input type="file" id="fileInput" accept="image/*" hidden>
+          <img id="imagePreview" alt="" hidden>
+          <div class="dropzone-empty" id="dropEmpty">
+            <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.2">
+              <rect x="3" y="5" width="18" height="14" rx="1"/>
+              <circle cx="8.5" cy="10.5" r="1.5"/>
+              <path d="M21 16l-5-5-9 9"/>
+            </svg>
+            <p class="dropzone-title">drop an image here, or <u>click to browse</u></p>
+            <p class="dropzone-sub">jpg · png · webp · up to 10mb</p>
+          </div>
+        </label>
+
+        <div class="prompt-block">
+          <label for="promptImage">prompt</label>
+          <textarea id="promptImage" rows="3"></textarea>
+        </div>
+
+        <div class="action-row">
+          <button type="button" class="btn btn-primary btn-large" id="analyzeImage" disabled>
+            <span class="btn-icon">→</span>
+            <span>analyze image</span>
+          </button>
+          <button type="button" class="btn btn-ghost" id="clearImage" disabled>clear</button>
+        </div>
+      </div>
+
+      <!-- TAB: WEBCAM -->
+      <div class="tabpanel" data-panel="webcam" role="tabpanel" aria-labelledby="tab-webcam" hidden>
+        <div class="video-frame">
+          <video id="webcamVideo" autoplay muted playsinline></video>
+          <div class="video-empty" id="webcamEmpty">
+            <p>camera idle</p>
+            <p class="video-empty-hint">click "start camera" to begin</p>
+          </div>
+          <div class="video-overlay" id="webcamOverlay" hidden>
+            <span class="overlay-dot"></span>
+            <span>live · sampling every <strong id="webcamIntervalDisplay">3</strong>s</span>
+          </div>
+        </div>
+
+        <div class="prompt-block">
+          <label for="promptWebcam">prompt</label>
+          <textarea id="promptWebcam" rows="3"></textarea>
+        </div>
+
+        <div class="control-grid">
+          <div class="field">
+            <label for="webcamFacing">camera</label>
+            <select id="webcamFacing">
+              <option value="user">front</option>
+              <option value="environment">back</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="webcamInterval">sample interval · <span id="webcamIntervalLabel">3s</span></label>
+            <input type="range" id="webcamInterval" min="1" max="30" value="3" step="1">
+          </div>
+        </div>
+
+        <div class="action-row">
+          <button type="button" class="btn btn-primary" id="startWebcam">start camera</button>
+          <button type="button" class="btn btn-ghost" id="stopWebcam" disabled>stop</button>
+          <span class="action-divider"></span>
+          <button type="button" class="btn btn-secondary" id="captureOnce" disabled>capture once</button>
+          <button type="button" class="btn btn-accent" id="webcamLoopToggle" disabled>start auto-loop</button>
+        </div>
+      </div>
+
+      <!-- TAB: CCTV -->
+      <div class="tabpanel" data-panel="cctv" role="tabpanel" aria-labelledby="tab-cctv" hidden>
+        <details class="warning-callout">
+          <summary><strong>before connecting</strong> — what works, what doesn't</summary>
+          <p>The backend opens RTSP streams server-side and re-emits them as HLS for your browser. It can only reach <strong>public-IP cameras</strong> — cameras on a home or office router need port forwarding or a cloud relay first. HLS preview adds 5-15s of visible delay; the AI sees the same frames the browser sees.</p>
+        </details>
+
+        <div class="control-grid control-grid-rtsp">
+          <div class="field field-wide">
+            <label for="rtspUrl">RTSP URL</label>
+            <input type="text" id="rtspUrl" autocomplete="off" spellcheck="false"
+                   placeholder="rtsp://camera-host:554/path">
+          </div>
+          <div class="field">
+            <label for="rtspUser">username <span class="field-opt">optional</span></label>
+            <input type="text" id="rtspUser" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="rtspPass">password <span class="field-opt">optional</span></label>
+            <input type="password" id="rtspPass" autocomplete="off">
+          </div>
+        </div>
+
+        <div class="action-row">
+          <button type="button" class="btn btn-primary" id="rtspConnect">connect stream</button>
+          <button type="button" class="btn btn-ghost" id="rtspDisconnect" disabled>disconnect</button>
+          <span id="rtspStatus" class="config-hint"></span>
+        </div>
+
+        <div class="video-frame video-frame-cctv">
+          <video id="cctvVideo" autoplay muted playsinline></video>
+          <div class="video-empty" id="cctvEmpty">
+            <p>no stream</p>
+            <p class="video-empty-hint">enter RTSP URL above and connect</p>
+          </div>
+          <div class="video-overlay" id="cctvOverlay" hidden>
+            <span class="overlay-dot"></span>
+            <span>live · cctv · sampling every <strong id="cctvIntervalDisplay">3</strong>s</span>
+          </div>
+        </div>
+
+        <div class="prompt-block">
+          <label for="promptCctv">prompt</label>
+          <textarea id="promptCctv" rows="3"></textarea>
+        </div>
+
+        <div class="control-grid">
+          <div class="field">
+            <label for="cctvInterval">sample interval · <span id="cctvIntervalLabel">3s</span></label>
+            <input type="range" id="cctvInterval" min="1" max="30" value="3" step="1">
+          </div>
+        </div>
+
+        <div class="action-row">
+          <button type="button" class="btn btn-secondary" id="cctvCaptureOnce" disabled>capture once</button>
+          <button type="button" class="btn btn-accent" id="cctvLoopToggle" disabled>start auto-loop</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- LIVE FEED -->
+    <aside class="panel panel-feed">
+      <header class="feed-head">
+        <div>
+          <h2 class="feed-title">descriptions</h2>
+          <p class="feed-sub"><span id="feedCount">0</span> · last 10 shown</p>
+        </div>
+        <button type="button" class="btn btn-ghost btn-small" id="clearFeed">clear</button>
+      </header>
+      <div class="feed-list" id="feedList" aria-live="polite"></div>
+      <div class="feed-empty" id="feedEmpty">
+        <p>no descriptions yet</p>
+        <p class="feed-empty-hint">submit a frame to begin</p>
+      </div>
+    </aside>
+
+  </section>
+
+  <!-- STATS STRIP -->
+  <section class="stats" aria-label="backend statistics">
+    <div class="stat">
+      <span class="stat-label">backend</span>
+      <span class="stat-value" id="statBackend">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">uptime</span>
+      <span class="stat-value mono" id="statUptime">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">requests</span>
+      <span class="stat-value mono" id="statRequests">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">avg latency</span>
+      <span class="stat-value mono" id="statLatency">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">queue</span>
+      <span class="stat-value mono" id="statQueue">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">vram</span>
+      <span class="stat-value mono" id="statVram">—</span>
+    </div>
+  </section>
+
+  <footer class="signoff">
+    <div class="signoff-rule" aria-hidden="true">
+      <span class="signoff-mark">✦</span>
+    </div>
+
+    <div class="signoff-grid">
+      <div class="signoff-credit">
+        <p class="signoff-eyebrow">a study in machine vision</p>
+        <h3 class="signoff-title">
+          Crafted by <em>Amit</em>
+        </h3>
+        <a href="https://github.com/amit-singhs" target="_blank" rel="noopener noreferrer" class="signoff-github">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+            <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2c-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.76 2.69 1.25 3.34.96.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.27-5.24-5.66 0-1.25.45-2.27 1.18-3.07-.12-.29-.51-1.45.11-3.02 0 0 .96-.31 3.15 1.17a10.95 10.95 0 0 1 5.74 0c2.18-1.48 3.14-1.17 3.14-1.17.62 1.57.23 2.73.11 3.02.74.8 1.18 1.82 1.18 3.07 0 4.4-2.69 5.37-5.25 5.65.41.36.78 1.06.78 2.13v3.16c0 .31.21.67.79.56C20.21 21.39 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5z"/>
+          </svg>
+          <span class="signoff-handle">github.com/amit-singhs</span>
+          <span class="signoff-arrow" aria-hidden="true">→</span>
+        </a>
+      </div>
+
+      <div class="signoff-meta">
+        <dl class="signoff-meta-list">
+          <div>
+            <dt>system</dt>
+            <dd>aperture · v1</dd>
+          </div>
+          <div>
+            <dt>vision model</dt>
+            <dd>qwen2.5-vl-3b</dd>
+          </div>
+          <div>
+            <dt>year</dt>
+            <dd>mmxxv</dd>
+          </div>
+        </dl>
+        <a href="#" id="docsLink" target="_blank" rel="noopener" class="signoff-docs">
+          <span>api docs</span>
+          <span class="signoff-arrow" aria-hidden="true">↗</span>
+        </a>
+      </div>
+    </div>
+  </footer>
+
+</main>
+
+<canvas id="frameCanvas" hidden></canvas>
+
+<script src="script.js"></script>
+</body>
+</html>
