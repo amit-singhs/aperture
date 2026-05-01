@@ -15,39 +15,65 @@ const DEFAULT_PROMPT =
 
 const MAX_FEED = 10;
 const STATS_POLL_MS = 5000;
-const LS_KEY = 'aperture.creds.v1';
+
+// In ANPR mode, the slider's "seconds" value is overridden with this fast cadence.
+// 600ms keeps overlays feeling live without flooding the backend or the GPU.
+// (Lower if your backend has plenty of headroom; higher to reduce load.)
+const ANPR_SAMPLE_INTERVAL_MS = 600;
+
+// Mode-aware credential storage. Each mode keeps its own URL + key
+// because they typically point at different Colab notebooks.
+const LS_PREFIX = 'aperture.creds.v2';
+const LS_MODE = 'aperture.mode.v1';
+const MODES = ['describe', 'anpr'];
 
 // ---------- state ----------
 const state = {
+  mode: 'describe',   // 'describe' | 'anpr'
   apiUrl: '',
   apiKey: '',
-  feed: [],            // newest first, capped at MAX_FEED
+  feed: [],            // descriptions, newest first, capped at MAX_FEED
+  plates: [],          // unique plates this session, newest first (no cap)
+  platesByKey: {},     // normalized plate text -> index in `plates`
+  // Last-seen detections per source — used to redraw overlay when video moves
+  lastDetections: { image: null, webcam: null, cctv: null },
   webcamStream: null,
-  webcamLoop: null,
-  cctvStream: null,    // backend stream id
-  cctvHls: null,       // hls.js instance
+  webcamLoopActive: false,
+  webcamLoopTimer: null,
+  webcamLoop: null,    // legacy
+  cctvStream: null,
+  cctvHls: null,
+  cctvLoopActive: false,
+  cctvLoopTimer: null,
   cctvLoop: null,
   selectedFile: null,
+  selectedFileBitmap: null,  // ImageBitmap of last analyzed image, for overlay re-renders
   statsTimer: null,
 };
 
 // ---------- creds ----------
+function lsKey(mode) { return `${LS_PREFIX}.${mode}`; }
+
 function loadCreds() {
   try {
-    const v = localStorage.getItem(LS_KEY);
-    if (!v) return;
+    const v = localStorage.getItem(lsKey(state.mode));
+    if (!v) {
+      $('apiUrl').value = '';
+      $('apiKey').value = '';
+      return;
+    }
     const { url, key } = JSON.parse(v);
-    if (url) $('apiUrl').value = url;
-    if (key) $('apiKey').value = key;
+    $('apiUrl').value = url || '';
+    $('apiKey').value = key || '';
   } catch (e) { /* ignore */ }
 }
 function saveCreds() {
   try {
-    localStorage.setItem(LS_KEY, JSON.stringify({
+    localStorage.setItem(lsKey(state.mode), JSON.stringify({
       url: $('apiUrl').value.trim(),
       key: $('apiKey').value.trim(),
     }));
-    flashHint('saved to this browser');
+    flashHint(`saved for ${state.mode} mode`);
   } catch (e) {
     flashHint('could not save', 'error');
   }
@@ -228,12 +254,335 @@ function escapeHtml(s) {
 
 $('clearFeed').onclick = () => { state.feed = []; renderFeed(); };
 
+// ============================================================
+// ANPR — overlay drawing & plate dedup
+// ============================================================
+
+// Source -> {video element, overlay canvas, anchor element for sizing}
+function getOverlayTargets(sourceLabel) {
+  if (sourceLabel === 'webcam' || sourceLabel === 'webcam-loop') {
+    return {
+      media: $('webcamVideo'),
+      overlay: $('webcamOverlay2'),
+      // The overlay is sized to the .video-frame parent
+    };
+  }
+  if (sourceLabel === 'cctv') {
+    return { media: $('cctvVideo'), overlay: $('cctvOverlay2') };
+  }
+  if (sourceLabel === 'image' || sourceLabel === 'file') {
+    return { media: $('imagePreview'), overlay: $('imageOverlay2') };
+  }
+  return { media: null, overlay: null };
+}
+
+// Draw the bounding boxes for a given source onto its overlay canvas.
+// `result` comes straight from /detect, with absolute pixel coords relative
+// to the original sent frame. We map those to display coordinates using the
+// known image_width / image_height.
+function drawOverlayForSource(sourceLabel, result) {
+  const { media, overlay } = getOverlayTargets(sourceLabel);
+  if (!media || !overlay) return;
+  if (state.mode !== 'anpr') return;  // skip drawing if user switched modes mid-flight
+
+  // Match the canvas pixel size to its display size, so 1 canvas pixel = 1 CSS pixel.
+  // This keeps text and lines crisp without manual DPR juggling.
+  const rect = overlay.getBoundingClientRect();
+  const cssW = Math.max(1, Math.round(rect.width));
+  const cssH = Math.max(1, Math.round(rect.height));
+  if (overlay.width !== cssW) overlay.width = cssW;
+  if (overlay.height !== cssH) overlay.height = cssH;
+
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  if (!result || !result.detections || !result.detections.length) return;
+
+  // Figure out the displayed rectangle of the underlying media inside its container.
+  // For <video> with object-fit: contain, we have to compute the letterbox bands manually.
+  const mediaRect = computeContainRect(
+    result.image_width, result.image_height, cssW, cssH
+  );
+
+  const sx = mediaRect.w / result.image_width;
+  const sy = mediaRect.h / result.image_height;
+
+  ctx.lineWidth = 2;
+  ctx.font = '600 14px "Geist Mono", ui-monospace, monospace';
+  ctx.textBaseline = 'bottom';
+
+  for (const det of result.detections) {
+    const [x1, y1, x2, y2] = det.box;
+    const dx = mediaRect.x + x1 * sx;
+    const dy = mediaRect.y + y1 * sy;
+    const dw = (x2 - x1) * sx;
+    const dh = (y2 - y1) * sy;
+
+    // Box
+    ctx.strokeStyle = '#5eead4';   // accent
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+    ctx.shadowBlur = 4;
+    ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh);
+    ctx.shadowBlur = 0;
+
+    // Corner brackets — gives the "tracking" feel
+    const bracketLen = Math.min(14, Math.max(6, dw * 0.15));
+    ctx.strokeStyle = '#5eead4';
+    ctx.lineWidth = 3;
+    drawCornerBrackets(ctx, dx, dy, dw, dh, bracketLen);
+    ctx.lineWidth = 2;
+
+    // Label (plate text + confidence)
+    if (det.plate_text) {
+      const label = `${det.plate_text}  ·  ${(det.confidence * 100).toFixed(0)}%`;
+      const padding = 6;
+      const metrics = ctx.measureText(label);
+      const labelW = metrics.width + padding * 2;
+      const labelH = 22;
+      const labelX = dx;
+      // Place label above the box if there's room, otherwise inside the top
+      const labelY = dy >= labelH ? dy - 2 : dy + labelH + 2;
+
+      ctx.fillStyle = 'rgba(8, 9, 12, 0.92)';
+      ctx.fillRect(labelX, labelY - labelH, labelW, labelH);
+      ctx.fillStyle = '#5eead4';
+      ctx.fillText(label, labelX + padding, labelY - 5);
+    }
+  }
+}
+
+function drawCornerBrackets(ctx, x, y, w, h, len) {
+  // top-left
+  ctx.beginPath();
+  ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y);
+  ctx.stroke();
+  // top-right
+  ctx.beginPath();
+  ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len);
+  ctx.stroke();
+  // bottom-left
+  ctx.beginPath();
+  ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h);
+  ctx.stroke();
+  // bottom-right
+  ctx.beginPath();
+  ctx.moveTo(x + w - len, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - len);
+  ctx.stroke();
+}
+
+// Compute the letterboxed rectangle of an `imgW x imgH` image fitted into
+// a `boxW x boxH` container with object-fit: contain.
+function computeContainRect(imgW, imgH, boxW, boxH) {
+  const scale = Math.min(boxW / imgW, boxH / imgH);
+  const w = imgW * scale;
+  const h = imgH * scale;
+  const x = (boxW - w) / 2;
+  const y = (boxH - h) / 2;
+  return { x, y, w, h };
+}
+
+// ---- plate dedup ----
+
+// OCR confusions — folded for fuzzy matching
+const OCR_CONFUSIONS = {
+  '0': 'O', 'O': 'O',
+  '1': 'I', 'I': 'I', 'L': 'I',
+  '5': 'S', 'S': 'S',
+  '8': 'B', 'B': 'B',
+  '2': 'Z', 'Z': 'Z',
+};
+
+// Normalize a plate string for fuzzy comparison. Strips non-alphanumerics,
+// uppercases, and folds common OCR confusions.
+function normalizePlate(s) {
+  if (!s) return '';
+  const upper = s.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  let out = '';
+  for (const ch of upper) {
+    out += OCR_CONFUSIONS[ch] || ch;
+  }
+  return out;
+}
+
+// Levenshtein distance — small implementation, fine for plate lengths (≤12 chars)
+function editDistance(a, b) {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = new Array(b.length + 1);
+  let curr = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[b.length];
+}
+
+// Find the closest existing plate within a small edit-distance threshold.
+// Returns the matched key, or null.
+function findFuzzyMatch(normalizedNew) {
+  const keys = Object.keys(state.platesByKey);
+  if (keys.length === 0) return null;
+  // Quick path: exact match
+  if (state.platesByKey[normalizedNew] !== undefined) return normalizedNew;
+  // Tolerance scales with plate length — for typical 6-10 char plates, allow 1-2 substitutions
+  const tolerance = normalizedNew.length >= 6 ? 2 : 1;
+  for (const k of keys) {
+    if (Math.abs(k.length - normalizedNew.length) > tolerance) continue;
+    if (editDistance(k, normalizedNew) <= tolerance) return k;
+  }
+  return null;
+}
+
+function addOrUpdatePlate(det, frameBlob, result) {
+  const normalized = normalizePlate(det.plate_text);
+  if (!normalized || normalized.length < 3) return;  // ignore garbage reads
+
+  const matchKey = findFuzzyMatch(normalized);
+
+  if (matchKey === null) {
+    // New plate — crop the thumbnail from the frame and add it
+    cropPlateThumb(frameBlob, det.box, result.image_width, result.image_height)
+      .then((thumbUrl) => {
+        const entry = {
+          key: normalized,
+          text: det.plate_text,           // displayed text (not normalized)
+          confidence: det.confidence,
+          ocr_confidence: det.ocr_confidence ?? 0,
+          firstSeen: new Date(),
+          thumbUrl,
+        };
+        state.plates.unshift(entry);
+        state.platesByKey[normalized] = 0;  // index will be wrong after more inserts; we re-index in renderPlates
+        renderPlates();
+      });
+  } else {
+    // Existing plate — keep the highest-confidence reading
+    const idx = state.plates.findIndex((p) => p.key === matchKey);
+    if (idx === -1) return;
+    const existing = state.plates[idx];
+    const newConf = det.ocr_confidence ?? 0;
+    if (newConf > (existing.ocr_confidence ?? 0)) {
+      existing.text = det.plate_text;
+      existing.ocr_confidence = newConf;
+      existing.confidence = det.confidence;
+      // Update thumbnail too — better confidence read often means closer/clearer plate
+      cropPlateThumb(frameBlob, det.box, result.image_width, result.image_height)
+        .then((thumbUrl) => {
+          if (existing.thumbUrl) URL.revokeObjectURL(existing.thumbUrl);
+          existing.thumbUrl = thumbUrl;
+          renderPlates();
+        });
+    }
+  }
+}
+
+// Crop a plate region out of a frame blob and return a blob URL for the thumbnail
+async function cropPlateThumb(frameBlob, box, imgW, imgH) {
+  try {
+    const bitmap = await createImageBitmap(frameBlob);
+    const [x1, y1, x2, y2] = box;
+    const w = Math.max(1, x2 - x1);
+    const h = Math.max(1, y2 - y1);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, x1, y1, w, h, 0, 0, w, h);
+    bitmap.close?.();
+    return await new Promise((resolve) => {
+      canvas.toBlob((b) => resolve(b ? URL.createObjectURL(b) : ''), 'image/jpeg', 0.85);
+    });
+  } catch (e) {
+    return '';
+  }
+}
+
+function renderPlates() {
+  const list = $('platesList');
+  const empty = $('platesEmpty');
+  $('platesCount').textContent = state.plates.length;
+
+  if (state.plates.length === 0) {
+    list.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  list.innerHTML = state.plates.map((p, i) => {
+    const time = p.firstSeen.toTimeString().slice(0, 8);
+    const conf = ((p.ocr_confidence ?? 0) * 100).toFixed(0);
+    const newestCls = i === 0 ? ' is-newest' : '';
+    const thumb = p.thumbUrl
+      ? `<div class="plate-thumb"><img src="${p.thumbUrl}" alt=""></div>`
+      : `<div class="plate-thumb"></div>`;
+    return `
+      <div class="plate-item${newestCls}">
+        ${thumb}
+        <div class="plate-info">
+          <div class="plate-text">${escapeHtml(p.text)}</div>
+          <div class="plate-meta">
+            <span class="plate-meta-time">first seen ${time}</span>
+            <span class="plate-meta-conf">ocr ${conf}%</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function clearPlates() {
+  // Free thumbnail blob URLs
+  for (const p of state.plates) {
+    if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
+  }
+  state.plates = [];
+  state.platesByKey = {};
+  renderPlates();
+}
+
+// Re-render overlays on layout changes (window resize, mode switch, etc.)
+function redrawAllOverlays() {
+  for (const source of ['image', 'webcam', 'cctv']) {
+    const result = state.lastDetections[source];
+    if (result) drawOverlayForSource(source, result);
+  }
+}
+window.addEventListener('resize', redrawAllOverlays);
+
+// Continuous overlay redraw — keeps boxes correctly positioned even when
+// underlying media element is resized by something we don't observe (e.g.
+// orientation change, scroll, video metadata updating dimensions).
+function startOverlayLoop() {
+  function frame() {
+    if (state.mode === 'anpr') {
+      redrawAllOverlays();
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
 // ---------- core: send a frame ----------
 async function sendFrame(blob, sourceLabel, prompt) {
   if (!state.apiUrl) {
     flashHint('configure backend connection first', 'error');
     return;
   }
+
+  if (state.mode === 'anpr') {
+    return sendFrameAnpr(blob, sourceLabel);
+  }
+  return sendFrameDescribe(blob, sourceLabel, prompt);
+}
+
+async function sendFrameDescribe(blob, sourceLabel, prompt) {
   const fd = new FormData();
   fd.append('image', blob, 'frame.jpg');
   fd.append('prompt', prompt || DEFAULT_PROMPT);
@@ -263,6 +612,44 @@ async function sendFrame(blob, sourceLabel, prompt) {
     });
   } catch (e) {
     pushFeed({ description: `network error · ${e.message}`, source: sourceLabel, error: true });
+  }
+}
+
+async function sendFrameAnpr(blob, sourceLabel) {
+  const fd = new FormData();
+  fd.append('image', blob, 'frame.jpg');
+  fd.append('run_ocr', 'true');
+  fd.append('source_type', sourceLabel || 'frame');
+  fd.append('source_id', 'aperture-frontend');
+
+  try {
+    const r = await fetch(`${state.apiUrl}/detect`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: fd,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // Surface errors in the plates panel as a transient message
+      console.warn('[anpr] error:', d.detail || r.status);
+      flashHint(`detect error: ${d.detail || r.status}`, 'error');
+      return;
+    }
+    handleDetectionResult(d, sourceLabel, blob);
+  } catch (e) {
+    flashHint(`network error: ${e.message}`, 'error');
+  }
+}
+
+function handleDetectionResult(result, sourceLabel, frameBlob) {
+  // Cache the raw detections for this source so we can re-render on resize
+  state.lastDetections[sourceLabel] = result;
+  drawOverlayForSource(sourceLabel, result);
+
+  // For each detection that has a plate_text, attempt to dedupe and add to log
+  for (const det of result.detections || []) {
+    if (!det.plate_text) continue;
+    addOrUpdatePlate(det, frameBlob, result);
   }
 }
 
@@ -522,6 +909,13 @@ function initImageTab() {
     input.value = '';
     analyzeBtn.disabled = true;
     clearBtn.disabled = true;
+    // Clear any ANPR overlay/cached detection for this source
+    state.lastDetections.image = null;
+    const overlay = $('imageOverlay2');
+    if (overlay) {
+      const ctx = overlay.getContext('2d');
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+    }
   };
 }
 
@@ -669,6 +1063,13 @@ function initWebcamTab() {
     captureBtn.disabled = true;
     loopBtn.disabled = true;
     flipBtn.disabled = true;
+    // Clear ANPR overlay
+    state.lastDetections.webcam = null;
+    const overlay = $('webcamOverlay2');
+    if (overlay) {
+      const ctx = overlay.getContext('2d');
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+    }
   }
 
   // Flip front/back without stopping the loop — just swap the underlying stream
@@ -753,7 +1154,7 @@ function initWebcamTab() {
   };
 
   function startWebcamLoop() {
-    const interval = Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
+    const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
     overlay.hidden = false;
     loopBtn.classList.add('is-active');
     loopBtn.textContent = 'stop auto-loop';
@@ -941,7 +1342,7 @@ function initCctvTab() {
   };
 
   function startCctvLoop() {
-    const interval = Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
+    const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
     overlay.hidden = false;
     loopBtn.classList.add('is-active');
     loopBtn.textContent = 'stop auto-loop';
@@ -1089,12 +1490,22 @@ function isLikelyMobile() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  // Restore last-used mode
+  try {
+    const stored = localStorage.getItem(LS_MODE);
+    if (stored && MODES.includes(stored)) state.mode = stored;
+  } catch (e) { /* ignore */ }
+  document.body.dataset.mode = state.mode;
+
+  initModeSwitch();
   loadCreds();
   initTabs();
   initImageTab();
   initWebcamTab();
   initCctvTab();
   renderFeed();
+  renderPlates();
+  startOverlayLoop();
 
   // Default to back-facing camera on mobile (it's what users mean by "the camera")
   if (isLikelyMobile()) {
@@ -1103,11 +1514,66 @@ document.addEventListener('DOMContentLoaded', () => {
 
   $('testConn').addEventListener('click', testConnection);
   $('saveCreds').addEventListener('click', saveCreds);
+  $('clearPlates').addEventListener('click', clearPlates);
 
   // If we have stored creds, auto-test
   if ($('apiUrl').value && $('apiKey').value) {
     setTimeout(testConnection, 200);
   }
 });
+
+function initModeSwitch() {
+  const buttons = $$('.mode-btn');
+  const rail = $('modeRail');
+
+  function moveRail() {
+    const active = buttons.find((b) => b.classList.contains('is-active'));
+    if (!active) return;
+    rail.style.left = `${active.offsetLeft}px`;
+    rail.style.width = `${active.offsetWidth}px`;
+  }
+
+  function activate(mode) {
+    if (!MODES.includes(mode)) return;
+    state.mode = mode;
+    document.body.dataset.mode = mode;
+    try { localStorage.setItem(LS_MODE, mode); } catch (e) { /* */ }
+
+    buttons.forEach((b) => {
+      const isActive = b.dataset.mode === mode;
+      b.classList.toggle('is-active', isActive);
+      b.setAttribute('aria-selected', isActive);
+    });
+    moveRail();
+
+    // Reload credentials for the new mode
+    loadCreds();
+
+    // Clear connection status — the URL has likely changed
+    setConnState('idle', 'awaiting connection');
+    $('connDetail').textContent = '';
+    stopStatsPolling();
+
+    // Auto-test if there are creds for this mode
+    if ($('apiUrl').value && $('apiKey').value) {
+      setTimeout(testConnection, 200);
+    }
+
+    // Force a redraw of overlays for the new mode
+    redrawAllOverlays();
+  }
+
+  buttons.forEach((b) => b.addEventListener('click', () => activate(b.dataset.mode)));
+  // Initial rail positioning
+  requestAnimationFrame(() => requestAnimationFrame(moveRail));
+  window.addEventListener('resize', moveRail);
+
+  // Sync button state with restored mode
+  buttons.forEach((b) => {
+    const isActive = b.dataset.mode === state.mode;
+    b.classList.toggle('is-active', isActive);
+    b.setAttribute('aria-selected', isActive);
+  });
+}
 
 })();

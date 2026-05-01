@@ -94,6 +94,7 @@ button, input, textarea, select {
 
 .topbar {
   display: flex; justify-content: space-between; align-items: center;
+  gap: 1.5rem;
   padding: 1.25rem 2rem;
   border-bottom: 1px solid var(--border-soft);
   background: linear-gradient(to bottom, rgba(16, 17, 21, 0.6), transparent);
@@ -157,6 +158,57 @@ button, input, textarea, select {
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
   50%      { box-shadow: 0 0 0 4px transparent; opacity: 0.5; }
+}
+
+/* ============================================================
+   MODE SWITCH (description vs anpr)
+   ============================================================ */
+
+.mode-switch {
+  display: flex;
+  position: relative;
+  background: var(--surface-1);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  padding: 3px;
+}
+.mode-btn {
+  background: transparent;
+  border: 0;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  position: relative;
+  z-index: 1;
+  border-radius: var(--r-xs);
+  color: var(--text-mute);
+  transition: color 0.2s var(--ease);
+  white-space: nowrap;
+}
+.mode-btn:hover { color: var(--text); }
+.mode-btn.is-active { color: var(--bg-deep); }
+.mode-btn-num {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.18em;
+  opacity: 0.75;
+}
+.mode-btn-label {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.95rem;
+  letter-spacing: -0.005em;
+}
+.mode-rail {
+  position: absolute;
+  top: 3px; bottom: 3px;
+  background: var(--accent);
+  border-radius: var(--r-xs);
+  transition: left 0.32s var(--ease-out), width 0.32s var(--ease-out);
+  z-index: 0;
+  box-shadow: 0 4px 12px -4px var(--accent-glow);
 }
 
 /* ============================================================
@@ -1040,6 +1092,101 @@ select {
 }
 
 /* ============================================================
+   DETECTION OVERLAY (ANPR mode)
+   ============================================================ */
+
+/* Sits on top of <video> or <img> inside .video-frame / .dropzone.
+   Pointer-events none so the underlying media still receives clicks. */
+.detection-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 4;
+  display: none;
+}
+.video-frame, .dropzone {
+  position: relative;  /* anchor for the absolute overlay */
+}
+/* Show overlays only in ANPR mode */
+body[data-mode="anpr"] .detection-overlay {
+  display: block;
+}
+
+/* ============================================================
+   PLATE CARDS (right-side panel, ANPR mode)
+   ============================================================ */
+
+.plate-item {
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-sm);
+  padding: 0.75rem 0.9rem;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.75rem;
+  align-items: center;
+  animation: feed-in 0.4s var(--ease-out);
+}
+.plate-item.is-newest {
+  border-left-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft), 0 8px 24px -8px var(--accent-glow);
+}
+.plate-thumb {
+  width: 56px;
+  height: 36px;
+  background: var(--bg-deep);
+  border-radius: var(--r-xs);
+  overflow: hidden;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+}
+.plate-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.plate-info {
+  min-width: 0;  /* allow truncation */
+}
+.plate-text {
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.05em;
+  word-break: break-all;
+}
+.plate-meta {
+  display: flex;
+  gap: 0.7rem;
+  margin-top: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+.plate-meta-time { color: var(--text-mute); }
+.plate-meta-conf { color: var(--accent); }
+
+/* Mode-toggle helpers — anything tagged with data-mode-show is hidden when
+   the body's data-mode doesn't match */
+body:not([data-mode="describe"]) [data-mode-show="describe"] { display: none !important; }
+body:not([data-mode="anpr"])     [data-mode-show="anpr"]     { display: none !important; }
+
+/* Hide the [data-mode] sub-spans inside hero text when not active */
+body:not([data-mode="describe"]) [data-mode-text] [data-mode="describe"] { display: none; }
+body:not([data-mode="anpr"])     [data-mode-text] [data-mode="anpr"]     { display: none; }
+body[data-mode="describe"] [data-mode-text] [data-mode="describe"] { display: inline; }
+body[data-mode="anpr"]     [data-mode-text] [data-mode="anpr"]     { display: inline; }
+body[data-mode="describe"] [data-mode-text] [data-mode="anpr"]     { display: none; }
+body[data-mode="anpr"]     [data-mode-text] [data-mode="describe"] { display: none; }
+
+/* ============================================================
    RESPONSIVE
    ============================================================ */
 
@@ -1053,7 +1200,17 @@ select {
 }
 
 @media (max-width: 720px) {
-  .topbar { padding: 1rem 1.25rem; }
+  .topbar {
+    padding: 1rem 1.25rem;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  .mode-switch {
+    order: 3;          /* drop to second row */
+    flex-basis: 100%;
+    justify-content: center;
+  }
+  .mode-btn { flex: 1; justify-content: center; }
   .brand-name { font-size: 1.05rem; }
   .brand-tag { font-size: 0.6rem; }
 

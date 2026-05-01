@@ -1,8 +1,10 @@
 # Aperture — Frame Intelligence
 
-Frontend for the Qwen2.5-VL frame description backend. Three input modes:
+Frontend for two backend APIs:
+- **Commentary mode**: video scene description via Qwen2.5-VL
+- **ANPR mode**: license-plate detection + OCR via YOLOv11 + EasyOCR
 
-- **Image** — upload or drag-and-drop a single image
+A mode switcher in the topbar toggles between the two. Each mode keeps its own URL + key in the browser, so you can have both Colab notebooks running and switch between them at will.
 - **Webcam** — use your device camera, with auto-loop sampling
 - **CCTV** — connect to an RTSP stream via the backend's RTSP→HLS proxy
 
