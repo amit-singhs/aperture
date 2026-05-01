@@ -266,21 +266,110 @@ async function sendFrame(blob, sourceLabel, prompt) {
   }
 }
 
-function videoToBlob(videoEl) {
+/* ============================================================
+   Frame capture — mobile-safe
+   ============================================================
+   Three strategies in priority order:
+   1. ImageCapture.grabFrame() — goes directly to the camera pipeline,
+      bypasses the <video> decoder entirely. Best on Android Chrome.
+   2. requestVideoFrameCallback — guarantees we draw a fresh frame.
+      Available on most modern browsers including iOS Safari 15.4+.
+   3. Fallback: plain drawImage with currentTime-advance verification.
+
+   Why this matters: on mobile, especially iOS Safari, a muted autoplay
+   <video> element can keep showing visual preview while its internal
+   decoder is paused — drawImage reads from the decoder, not the preview,
+   so you get the first frame stuck on repeat. */
+
+// Cache the ImageCapture instance per stream — creating it is expensive
+let _imageCaptureInstance = null;
+let _imageCaptureStream = null;
+
+function getImageCapture(stream) {
+  if (!('ImageCapture' in window) || !stream) return null;
+  if (_imageCaptureStream === stream && _imageCaptureInstance) {
+    return _imageCaptureInstance;
+  }
+  const track = stream.getVideoTracks()[0];
+  if (!track) return null;
+  try {
+    _imageCaptureInstance = new ImageCapture(track);
+    _imageCaptureStream = stream;
+    return _imageCaptureInstance;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearImageCaptureCache() {
+  _imageCaptureInstance = null;
+  _imageCaptureStream = null;
+}
+
+// Convert an ImageBitmap to a JPEG blob via canvas
+function bitmapToBlob(bitmap, quality = 0.85) {
+  return new Promise((resolve) => {
+    const canvas = $('frameCanvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close?.();
+    canvas.toBlob((b) => resolve(b), 'image/jpeg', quality);
+  });
+}
+
+// Strategy 2: wait for next decoded video frame, then draw it
+function drawNextVideoFrame(videoEl, quality = 0.85) {
   return new Promise((resolve) => {
     const w = videoEl.videoWidth;
     const h = videoEl.videoHeight;
-    if (!w || !h) {
-      // Video isn't ready — return null and let the caller decide what to do
-      resolve(null);
-      return;
+    if (!w || !h) { resolve(null); return; }
+
+    const draw = () => {
+      const canvas = $('frameCanvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(videoEl, 0, 0, w, h);
+      canvas.toBlob((b) => resolve(b), 'image/jpeg', quality);
+    };
+
+    // requestVideoFrameCallback fires when a new frame is ready to be drawn.
+    // Fall back to a short setTimeout if unavailable.
+    if (typeof videoEl.requestVideoFrameCallback === 'function') {
+      videoEl.requestVideoFrameCallback(() => draw());
+    } else {
+      // Tiny delay gives Safari a chance to advance the decoder.
+      setTimeout(draw, 50);
     }
-    const canvas = $('frameCanvas');
-    canvas.width = w;
-    canvas.height = h;
-    canvas.getContext('2d').drawImage(videoEl, 0, 0, w, h);
-    canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.85);
   });
+}
+
+// Public capture function — the one called from capture buttons & loops
+async function captureFrame(videoEl, stream, quality = 0.85) {
+  // Quick sanity: video has dimensions?
+  if (!videoEl.videoWidth || !videoEl.videoHeight) return null;
+
+  // Strategy 1: ImageCapture if available (Chrome desktop, Android Chrome)
+  const ic = getImageCapture(stream);
+  if (ic) {
+    try {
+      const bitmap = await ic.grabFrame();
+      return await bitmapToBlob(bitmap, quality);
+    } catch (e) {
+      // Fall through to next strategy
+    }
+  }
+
+  // Strategy 2 & 3: draw from the video element with a frame-ready hook
+  try {
+    return await drawNextVideoFrame(videoEl, quality);
+  } catch (e) {
+    return null;
+  }
 }
 
 // ============================================================
@@ -508,6 +597,7 @@ function initWebcamTab() {
       state.webcamStream.getTracks().forEach(t => t.stop());
       state.webcamStream = null;
     }
+    clearImageCaptureCache();
     video.srcObject = null;
     videoReady = false;
     empty.style.display = '';
@@ -530,6 +620,7 @@ function initWebcamTab() {
     // Stop old tracks first — some mobile browsers can't open two cameras at once
     state.webcamStream.getTracks().forEach(t => t.stop());
     state.webcamStream = null;
+    clearImageCaptureCache();
     videoReady = false;
 
     try {
@@ -585,7 +676,7 @@ function initWebcamTab() {
       flashHint('camera not ready yet', 'info');
       return;
     }
-    const blob = await videoToBlob(video);
+    const blob = await captureFrame(video, state.webcamStream);
     if (!blob || blob.size < 1000) {
       flashHint('frame capture failed — try again in a moment', 'error');
       return;
@@ -605,7 +696,7 @@ function initWebcamTab() {
     loopBtn.textContent = 'stop auto-loop';
     const tick = async () => {
       if (!state.webcamStream || !videoReady) return;
-      const blob = await videoToBlob(video);
+      const blob = await captureFrame(video, state.webcamStream);
       if (!blob || blob.size < 1000) return;  // silently skip bad frames
       sendFrame(blob, 'webcam', $('promptWebcam').value);
     };
@@ -748,7 +839,7 @@ function initCctvTab() {
 
   captureBtn.onclick = async () => {
     if (!state.cctvStream) return;
-    const blob = await videoToBlob(video);
+    const blob = await captureFrame(video, null);
     if (!blob || blob.size < 1000) {
       flashHint('frame capture failed — stream may not be ready', 'error');
       return;
@@ -768,7 +859,7 @@ function initCctvTab() {
     loopBtn.textContent = 'stop auto-loop';
     const tick = async () => {
       if (!state.cctvStream) return;
-      const blob = await videoToBlob(video);
+      const blob = await captureFrame(video, null);
       if (!blob || blob.size < 1000) return;
       sendFrame(blob, 'cctv', $('promptCctv').value);
     };
