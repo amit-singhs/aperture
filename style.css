@@ -1107,3 +1107,88 @@ select {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ============================================================
+   Diagnostics panel (?debug=1)
+   ============================================================ */
+
+#diagPanel {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  width: 320px;
+  max-width: calc(100vw - 2rem);
+  background: rgba(8, 9, 12, 0.96);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-md);
+  padding: 0.85rem;
+  z-index: 200;
+  box-shadow: 0 12px 40px -8px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--accent-soft);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.diag-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.6rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+.diag-title {
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+}
+.diag-count { color: var(--text-mute); }
+.diag-thumbs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.3rem;
+}
+.diag-thumb {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--surface-2);
+  border-radius: var(--r-xs);
+  overflow: hidden;
+}
+.diag-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.diag-thumb-meta {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 2px 4px;
+  background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.55rem;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.diag-hint {
+  margin-top: 0.6rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-mute);
+  font-family: var(--font-body);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+@media (max-width: 480px) {
+  #diagPanel {
+    width: calc(100vw - 1rem);
+    right: 0.5rem;
+    bottom: 0.5rem;
+  }
+}

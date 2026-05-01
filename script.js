@@ -267,25 +267,37 @@ async function sendFrame(blob, sourceLabel, prompt) {
 }
 
 /* ============================================================
-   Frame capture — mobile-safe
+   Frame capture — bulletproof version
    ============================================================
-   Three strategies in priority order:
-   1. ImageCapture.grabFrame() — goes directly to the camera pipeline,
-      bypasses the <video> decoder entirely. Best on Android Chrome.
-   2. requestVideoFrameCallback — guarantees we draw a fresh frame.
-      Available on most modern browsers including iOS Safari 15.4+.
-   3. Fallback: plain drawImage with currentTime-advance verification.
+   Critical iOS Safari facts (that bit us):
+   - ImageCapture API is NOT available on iOS Safari at all.
+   - requestVideoFrameCallback is unreliable on iOS Safari — may fire once
+     at the first frame and then never again, hanging any code that awaits it.
+     (Documented widely; videojs ships an explicit iOS workaround.)
+   - Plain drawImage(video, ...) actually works fine on iOS Safari, AS LONG AS
+     the video is actively playing (currentTime advancing).
 
-   Why this matters: on mobile, especially iOS Safari, a muted autoplay
-   <video> element can keep showing visual preview while its internal
-   decoder is paused — drawImage reads from the decoder, not the preview,
-   so you get the first frame stuck on repeat. */
+   So: detect iOS and skip the fancy APIs. Verify the video is alive via
+   currentTime advancement. If a capture path hangs, time it out so the
+   loop keeps running.
 
-// Cache the ImageCapture instance per stream — creating it is expensive
+   Public flag: window.APERTURE_DEBUG_CAPTURE = true — to print diagnostics. */
+
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+function debugCapture(...args) {
+  if (window.APERTURE_DEBUG_CAPTURE) {
+    console.log('[capture]', ...args);
+  }
+}
+
+// Cache the ImageCapture instance per stream — not used on iOS
 let _imageCaptureInstance = null;
 let _imageCaptureStream = null;
 
 function getImageCapture(stream) {
+  if (IS_IOS) return null;  // iOS Safari has no ImageCapture
   if (!('ImageCapture' in window) || !stream) return null;
   if (_imageCaptureStream === stream && _imageCaptureInstance) {
     return _imageCaptureInstance;
@@ -306,70 +318,108 @@ function clearImageCaptureCache() {
   _imageCaptureStream = null;
 }
 
-// Convert an ImageBitmap to a JPEG blob via canvas
-function bitmapToBlob(bitmap, quality = 0.85) {
-  return new Promise((resolve) => {
-    const canvas = $('frameCanvas');
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(bitmap, 0, 0);
-    bitmap.close?.();
-    canvas.toBlob((b) => resolve(b), 'image/jpeg', quality);
+// Keep a record of last currentTime so we can detect a stalled video
+const _lastCurrentTime = new WeakMap();
+
+function isVideoAdvancing(videoEl) {
+  const now = videoEl.currentTime;
+  const prev = _lastCurrentTime.get(videoEl);
+  _lastCurrentTime.set(videoEl, now);
+  if (prev === undefined) return true;     // first call
+  return now > prev;                       // strict: must have advanced
+}
+
+// Force the video to keep playing — call before each capture attempt.
+// On iOS Safari, video.play() returns a Promise that we can await.
+// Calling it on an already-playing video is a no-op.
+async function ensureVideoPlaying(videoEl) {
+  if (videoEl.paused || videoEl.ended) {
+    try {
+      await videoEl.play();
+      debugCapture('video.play() resolved, paused=', videoEl.paused);
+    } catch (e) {
+      debugCapture('video.play() failed:', e.message);
+    }
+  }
+}
+
+// Wrap a Promise with a hard timeout — guarantees we never hang the loop.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      debugCapture(`timeout: ${label} (${ms}ms)`);
+      resolve(null);
+    }, ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); debugCapture(`error in ${label}:`, e.message); resolve(null); }
+    );
   });
 }
 
-// Strategy 2: wait for next decoded video frame, then draw it
-function drawNextVideoFrame(videoEl, quality = 0.85) {
+// Synchronously draw the video element to canvas and produce a JPEG blob.
+// This is the path we use on iOS — boring and reliable.
+function drawAndEncode(videoEl, quality = 0.85) {
   return new Promise((resolve) => {
     const w = videoEl.videoWidth;
     const h = videoEl.videoHeight;
-    if (!w || !h) { resolve(null); return; }
-
-    const draw = () => {
-      const canvas = $('frameCanvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.clearRect(0, 0, w, h);
-      ctx.drawImage(videoEl, 0, 0, w, h);
-      canvas.toBlob((b) => resolve(b), 'image/jpeg', quality);
-    };
-
-    // requestVideoFrameCallback fires when a new frame is ready to be drawn.
-    // Fall back to a short setTimeout if unavailable.
-    if (typeof videoEl.requestVideoFrameCallback === 'function') {
-      videoEl.requestVideoFrameCallback(() => draw());
-    } else {
-      // Tiny delay gives Safari a chance to advance the decoder.
-      setTimeout(draw, 50);
+    if (!w || !h) {
+      debugCapture('drawAndEncode: zero dimensions, returning null');
+      resolve(null);
+      return;
     }
+    const canvas = $('frameCanvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(videoEl, 0, 0, w, h);
+    canvas.toBlob((b) => {
+      debugCapture(`encoded ${w}x${h}, blob.size=${b?.size}, currentTime=${videoEl.currentTime.toFixed(3)}`);
+      resolve(b);
+    }, 'image/jpeg', quality);
   });
 }
 
-// Public capture function — the one called from capture buttons & loops
+// Public capture function — called from capture buttons & loops
 async function captureFrame(videoEl, stream, quality = 0.85) {
-  // Quick sanity: video has dimensions?
-  if (!videoEl.videoWidth || !videoEl.videoHeight) return null;
+  if (!videoEl.videoWidth || !videoEl.videoHeight) {
+    debugCapture('captureFrame: video has no dimensions');
+    return null;
+  }
 
-  // Strategy 1: ImageCapture if available (Chrome desktop, Android Chrome)
-  const ic = getImageCapture(stream);
-  if (ic) {
-    try {
-      const bitmap = await ic.grabFrame();
-      return await bitmapToBlob(bitmap, quality);
-    } catch (e) {
-      // Fall through to next strategy
+  // Always make sure the video is actually playing before we read a frame
+  await ensureVideoPlaying(videoEl);
+
+  const advancing = isVideoAdvancing(videoEl);
+  debugCapture(`captureFrame: iOS=${IS_IOS}, paused=${videoEl.paused}, advancing=${advancing}, currentTime=${videoEl.currentTime.toFixed(3)}`);
+
+  // On non-iOS, ImageCapture is the gold standard — bypass video element entirely
+  if (!IS_IOS) {
+    const ic = getImageCapture(stream);
+    if (ic) {
+      const blob = await withTimeout(
+        (async () => {
+          const bitmap = await ic.grabFrame();
+          const canvas = $('frameCanvas');
+          canvas.width = bitmap.width;
+          canvas.height = bitmap.height;
+          const ctx = canvas.getContext('2d');
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(bitmap, 0, 0);
+          bitmap.close?.();
+          return await new Promise((r) => canvas.toBlob(r, 'image/jpeg', quality));
+        })(),
+        2000,
+        'ImageCapture.grabFrame'
+      );
+      if (blob && blob.size > 1000) return blob;
+      // fall through to drawImage
     }
   }
 
-  // Strategy 2 & 3: draw from the video element with a frame-ready hook
-  try {
-    return await drawNextVideoFrame(videoEl, quality);
-  } catch (e) {
-    return null;
-  }
+  // Universal path: just draw the video element. Works on iOS Safari, all browsers.
+  return await withTimeout(drawAndEncode(videoEl, quality), 2000, 'drawAndEncode');
 }
 
 // ============================================================
@@ -565,10 +615,23 @@ function initWebcamTab() {
     try {
       const stream = await openCamera(facing.value);
       state.webcamStream = stream;
+
+      // iOS-specific: enforce playsinline at runtime too. Without this,
+      // tapping play would full-screen the video on some iOS versions.
+      video.setAttribute('playsinline', '');
+      video.setAttribute('webkit-playsinline', '');
+      video.muted = true;
+
       video.srcObject = stream;
 
-      // iOS specifically requires play() in response to a user gesture, even when muted+autoplay are set
-      try { await video.play(); } catch (e) { /* some browsers throw, video still plays */ }
+      // iOS specifically requires play() to be awaited in response to a user gesture.
+      // We're inside an onclick handler so this is the right time.
+      try {
+        await video.play();
+        debugCapture('initial video.play() resolved, paused=', video.paused);
+      } catch (e) {
+        debugCapture('initial video.play() error:', e.message);
+      }
 
       await waitForVideoReady(video);
       videoReady = true;
@@ -592,7 +655,7 @@ function initWebcamTab() {
   }
 
   async function stopCamera() {
-    if (state.webcamLoop) stopWebcamLoop();
+    if (state.webcamLoopActive) stopWebcamLoop();
     if (state.webcamStream) {
       state.webcamStream.getTracks().forEach(t => t.stop());
       state.webcamStream = null;
@@ -611,7 +674,7 @@ function initWebcamTab() {
   // Flip front/back without stopping the loop — just swap the underlying stream
   async function flipCamera() {
     if (!state.webcamStream) return;
-    const wasLooping = !!state.webcamLoop;
+    const wasLooping = !!state.webcamLoopActive;
     if (wasLooping) stopWebcamLoop();
 
     facing.value = facing.value === 'user' ? 'environment' : 'user';
@@ -685,7 +748,7 @@ function initWebcamTab() {
   };
 
   loopBtn.onclick = () => {
-    if (state.webcamLoop) stopWebcamLoop();
+    if (state.webcamLoopActive) stopWebcamLoop();
     else startWebcamLoop();
   };
 
@@ -694,19 +757,44 @@ function initWebcamTab() {
     overlay.hidden = false;
     loopBtn.classList.add('is-active');
     loopBtn.textContent = 'stop auto-loop';
+
+    // Self-rescheduling loop: each tick waits for the previous send to FINISH
+    // before scheduling the next. This prevents requests from overlapping and
+    // means we always capture-then-send a fresh frame each cycle.
+    state.webcamLoopActive = true;
+
     const tick = async () => {
-      if (!state.webcamStream || !videoReady) return;
-      const blob = await captureFrame(video, state.webcamStream);
-      if (!blob || blob.size < 1000) return;  // silently skip bad frames
-      sendFrame(blob, 'webcam', $('promptWebcam').value);
+      if (!state.webcamLoopActive) return;
+      const t0 = performance.now();
+      try {
+        if (state.webcamStream && videoReady) {
+          const blob = await captureFrame(video, state.webcamStream);
+          debugCapture(`tick: blob=${blob?.size ?? 'null'} bytes`);
+          if (blob && blob.size > 1000) {
+            recordDiag(blob, video.currentTime, blob.size);
+            await sendFrame(blob, 'webcam', $('promptWebcam').value);
+          }
+        }
+      } catch (e) {
+        debugCapture('tick error:', e.message);
+      }
+      // Compute the wait so cycles stay close to `interval` regardless of inference time.
+      // If inference took longer than the interval, the next tick fires immediately.
+      if (!state.webcamLoopActive) return;
+      const elapsed = performance.now() - t0;
+      const wait = Math.max(0, interval - elapsed);
+      state.webcamLoopTimer = setTimeout(tick, wait);
     };
     tick();
-    state.webcamLoop = setInterval(tick, interval);
   }
 
   function stopWebcamLoop() {
-    clearInterval(state.webcamLoop);
-    state.webcamLoop = null;
+    state.webcamLoopActive = false;
+    if (state.webcamLoopTimer) {
+      clearTimeout(state.webcamLoopTimer);
+      state.webcamLoopTimer = null;
+    }
+    state.webcamLoop = null;  // legacy
     overlay.hidden = true;
     loopBtn.classList.remove('is-active');
     loopBtn.textContent = 'start auto-loop';
@@ -811,7 +899,7 @@ function initCctvTab() {
   }
 
   disconnectBtn.onclick = async () => {
-    if (state.cctvLoop) stopCctvLoop();
+    if (state.cctvLoopActive) stopCctvLoop();
     if (state.cctvHls) { state.cctvHls.destroy(); state.cctvHls = null; }
     video.srcObject = null;
     video.removeAttribute('src');
@@ -848,7 +936,7 @@ function initCctvTab() {
   };
 
   loopBtn.onclick = () => {
-    if (state.cctvLoop) stopCctvLoop();
+    if (state.cctvLoopActive) stopCctvLoop();
     else startCctvLoop();
   };
 
@@ -857,17 +945,36 @@ function initCctvTab() {
     overlay.hidden = false;
     loopBtn.classList.add('is-active');
     loopBtn.textContent = 'stop auto-loop';
+
+    state.cctvLoopActive = true;
+
     const tick = async () => {
-      if (!state.cctvStream) return;
-      const blob = await captureFrame(video, null);
-      if (!blob || blob.size < 1000) return;
-      sendFrame(blob, 'cctv', $('promptCctv').value);
+      if (!state.cctvLoopActive) return;
+      const t0 = performance.now();
+      try {
+        if (state.cctvStream) {
+          const blob = await captureFrame(video, null);
+          if (blob && blob.size > 1000) {
+            recordDiag(blob, video.currentTime, blob.size);
+            await sendFrame(blob, 'cctv', $('promptCctv').value);
+          }
+        }
+      } catch (e) {
+        debugCapture('cctv tick error:', e.message);
+      }
+      if (!state.cctvLoopActive) return;
+      const elapsed = performance.now() - t0;
+      const wait = Math.max(0, interval - elapsed);
+      state.cctvLoopTimer = setTimeout(tick, wait);
     };
     tick();
-    state.cctvLoop = setInterval(tick, interval);
   }
   function stopCctvLoop() {
-    clearInterval(state.cctvLoop);
+    state.cctvLoopActive = false;
+    if (state.cctvLoopTimer) {
+      clearTimeout(state.cctvLoopTimer);
+      state.cctvLoopTimer = null;
+    }
     state.cctvLoop = null;
     overlay.hidden = true;
     loopBtn.classList.remove('is-active');
@@ -889,9 +996,91 @@ window.addEventListener('beforeunload', () => {
   }
 });
 
+// When the user comes back to the tab, iOS may have paused the video.
+// Make sure it's playing again so captures don't return stale frames.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  const video = $('webcamVideo');
+  if (state.webcamStream && video.paused) {
+    debugCapture('visibility returned, restarting video.play()');
+    video.play().catch(() => {});
+  }
+});
+
+// ============================================================
+// Visible diagnostics panel (enabled by ?debug=1 in URL)
+// ============================================================
+// Shows thumbnails of the most recent captures plus per-capture data.
+// Critical for debugging on phones without browser dev tools — you can
+// SEE whether captures are visually changing or stuck on the same frame.
+
+const _diagState = {
+  enabled: false,
+  panel: null,
+  thumbList: null,
+  countLabel: null,
+  count: 0,
+  maxThumbs: 6,
+};
+
+function ensureDiagPanel() {
+  if (_diagState.panel) return;
+  const panel = document.createElement('aside');
+  panel.id = 'diagPanel';
+  panel.innerHTML = `
+    <div class="diag-head">
+      <span class="diag-title">capture diagnostic</span>
+      <span class="diag-count" id="diagCount">0 captures</span>
+    </div>
+    <div class="diag-thumbs" id="diagThumbs"></div>
+    <p class="diag-hint">If thumbnails are all identical, the capture is stuck. If they change but descriptions don't, the bug is downstream.</p>
+  `;
+  document.body.appendChild(panel);
+  _diagState.panel = panel;
+  _diagState.thumbList = panel.querySelector('#diagThumbs');
+  _diagState.countLabel = panel.querySelector('#diagCount');
+}
+
+function recordDiag(blob, currentTime, sizeBytes) {
+  if (!_diagState.enabled) return;
+  ensureDiagPanel();
+  _diagState.count += 1;
+  _diagState.countLabel.textContent = `${_diagState.count} captures`;
+
+  const url = URL.createObjectURL(blob);
+  const wrapper = document.createElement('div');
+  wrapper.className = 'diag-thumb';
+  wrapper.innerHTML = `
+    <img src="${url}" alt="">
+    <div class="diag-thumb-meta">
+      <span>#${_diagState.count}</span>
+      <span>${(sizeBytes / 1024).toFixed(0)}KB</span>
+      <span>t=${currentTime.toFixed(2)}s</span>
+    </div>
+  `;
+  // Newest first
+  _diagState.thumbList.insertBefore(wrapper, _diagState.thumbList.firstChild);
+
+  // Trim & free old object URLs
+  while (_diagState.thumbList.children.length > _diagState.maxThumbs) {
+    const old = _diagState.thumbList.lastChild;
+    const oldImg = old.querySelector('img');
+    if (oldImg) URL.revokeObjectURL(oldImg.src);
+    old.remove();
+  }
+}
+
 // ============================================================
 // INIT
 // ============================================================
+
+// URL-based debug toggle: visit ?debug=1 to see capture-pipeline diagnostics
+// in the console AND the on-page diagnostics panel.
+if (new URLSearchParams(location.search).has('debug')) {
+  window.APERTURE_DEBUG_CAPTURE = true;
+  _diagState.enabled = true;
+  console.log('[aperture] debug logging ON');
+}
 
 // Best-effort detection: touch device + narrow viewport → mobile.
 // Used to pick a sensible default camera. The user can still flip.
