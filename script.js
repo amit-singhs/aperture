@@ -661,6 +661,11 @@ async function sendFrameAnpr(blob, sourceLabel) {
   const fd = new FormData();
   fd.append('image', blob, 'frame.jpg');
   fd.append('run_ocr', 'true');
+  // Always request debug info from backend so we can surface it in the console
+  // if needed (without the user having to restart anything).
+  if (window.APERTURE_DEBUG_ANPR) {
+    fd.append('debug', 'true');
+  }
   fd.append('source_type', sourceLabel || 'frame');
   fd.append('source_id', 'aperture-frontend');
 
@@ -672,13 +677,16 @@ async function sendFrameAnpr(blob, sourceLabel) {
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) {
-      // Surface errors in the plates panel as a transient message
-      console.warn('[anpr] error:', d.detail || r.status);
+      console.warn('[anpr] error:', d.detail || r.status, d);
       flashHint(`detect error: ${d.detail || r.status}`, 'error');
       return;
     }
+    if (window.APERTURE_DEBUG_ANPR) {
+      console.log(`[anpr] ${d.detections?.length ?? 0} detections in ${d.inference_seconds}s`, d);
+    }
     handleDetectionResult(d, sourceLabel, blob);
   } catch (e) {
+    console.error('[anpr] network error:', e);
     flashHint(`network error: ${e.message}`, 'error');
   }
 }
@@ -1530,8 +1538,9 @@ function recordDiag(blob, currentTime, sizeBytes) {
 // in the console AND the on-page diagnostics panel.
 if (new URLSearchParams(location.search).has('debug')) {
   window.APERTURE_DEBUG_CAPTURE = true;
+  window.APERTURE_DEBUG_ANPR = true;
   _diagState.enabled = true;
-  console.log('[aperture] debug logging ON');
+  console.log('[aperture] debug logging ON (capture + anpr)');
 }
 
 // Best-effort detection: touch device + narrow viewport → mobile.
