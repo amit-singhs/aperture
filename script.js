@@ -361,34 +361,61 @@ function drawOverlayForSource(sourceLabel, result) {
     const dw = (x2 - x1) * sx;
     const dh = (y2 - y1) * sy;
 
-    // Box
-    ctx.strokeStyle = '#5eead4';
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
-    ctx.shadowBlur = 4;
-    ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh);
-    ctx.shadowBlur = 0;
+    // "Locking on" visual: faint/animated while gathering OCR votes,
+    // solid + bright once we have consensus text.
+    const hasConsensus = !!det.plate_text;
+    const accentColor = '#5eead4';
+    const dimColor = 'rgba(94, 234, 212, 0.45)';
 
-    // Corner brackets
-    const bracketLen = Math.min(14, Math.max(6, dw * 0.15));
-    ctx.strokeStyle = '#5eead4';
-    ctx.lineWidth = 3;
-    drawCornerBrackets(ctx, dx, dy, dw, dh, bracketLen);
-    ctx.lineWidth = 2;
+    if (hasConsensus) {
+      // Solid box, bright corners, label
+      ctx.strokeStyle = accentColor;
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+      ctx.shadowBlur = 4;
+      ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh);
+      ctx.shadowBlur = 0;
 
-    // Label (plate text + confidence)
-    if (det.plate_text) {
-      const label = `${det.plate_text}  ·  ${(det.confidence * 100).toFixed(0)}%`;
+      const bracketLen = Math.min(14, Math.max(6, dw * 0.15));
+      ctx.strokeStyle = accentColor;
+      ctx.lineWidth = 3;
+      drawCornerBrackets(ctx, dx, dy, dw, dh, bracketLen);
+      ctx.lineWidth = 2;
+
+      // Label
+      const conf = (det.ocr_confidence != null ? det.ocr_confidence : det.confidence) * 100;
+      const label = `${det.plate_text}  ·  ${conf.toFixed(0)}%`;
       const padding = 6;
       const metrics = ctx.measureText(label);
       const labelW = metrics.width + padding * 2;
       const labelH = 22;
-      const labelX = dx;
       const labelY = dy >= labelH ? dy - 2 : dy + labelH + 2;
-
       ctx.fillStyle = 'rgba(8, 9, 12, 0.92)';
-      ctx.fillRect(labelX, labelY - labelH, labelW, labelH);
-      ctx.fillStyle = '#5eead4';
-      ctx.fillText(label, labelX + padding, labelY - 5);
+      ctx.fillRect(dx, labelY - labelH, labelW, labelH);
+      ctx.fillStyle = accentColor;
+      ctx.fillText(label, dx + padding, labelY - 5);
+    } else {
+      // Searching: dashed dim outline + corner brackets only, no label
+      ctx.setLineDash([6, 4]);
+      ctx.strokeStyle = dimColor;
+      ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh);
+      ctx.setLineDash([]);
+
+      const bracketLen = Math.min(14, Math.max(6, dw * 0.15));
+      ctx.strokeStyle = dimColor;
+      ctx.lineWidth = 3;
+      drawCornerBrackets(ctx, dx, dy, dw, dh, bracketLen);
+      ctx.lineWidth = 2;
+
+      // Vote count indicator (small, top-right of box) so the user can
+      // see that the system IS working — just gathering more reads.
+      if (det.vote_count !== undefined && det.vote_count > 0) {
+        ctx.font = '500 11px "Geist Mono", ui-monospace, monospace';
+        ctx.fillStyle = dimColor;
+        ctx.textBaseline = 'top';
+        ctx.fillText(`reading ${det.vote_count}/2`, dx + 4, dy + 4);
+        ctx.font = '600 14px "Geist Mono", ui-monospace, monospace';
+        ctx.textBaseline = 'bottom';
+      }
     }
   }
 }
@@ -481,39 +508,60 @@ function findFuzzyMatch(normalizedNew) {
   return null;
 }
 
-function addOrUpdatePlate(det, frameBlob, result) {
+function addOrUpdatePlate(det, frameBlob, result, sourceLabel) {
+  // For video sources we want at least 2 votes before logging (single-frame
+  // OCR is too noisy). For still images there's only one frame so accept it
+  // immediately — the UI also lets the user re-analyze the same image.
+  const isStillImage = sourceLabel === 'image' || sourceLabel === 'file';
+  if (!det.plate_text) return;
+  if (!isStillImage && det.vote_count !== undefined && det.vote_count < 2) {
+    return;
+  }
+
   const normalized = normalizePlate(det.plate_text);
-  if (!normalized || normalized.length < 3) return;  // ignore garbage reads
+  if (!normalized || normalized.length < 3) return;
 
-  const matchKey = findFuzzyMatch(normalized);
+  // Primary: match by tracker ID (backend-assigned, stable across frames)
+  // Secondary: fuzzy match on text (handles tracker death + respawn for same plate)
+  let matchedIdx = -1;
+  if (det.plate_id) {
+    matchedIdx = state.plates.findIndex((p) => p.plate_id === det.plate_id);
+  }
+  if (matchedIdx === -1) {
+    const fuzzyKey = findFuzzyMatch(normalized);
+    if (fuzzyKey !== null) {
+      matchedIdx = state.plates.findIndex((p) => p.key === fuzzyKey);
+    }
+  }
 
-  if (matchKey === null) {
-    // New plate — crop the thumbnail from the frame and add it
+  if (matchedIdx === -1) {
+    // New plate
     cropPlateThumb(frameBlob, det.box, result.image_width, result.image_height)
       .then((thumbUrl) => {
         const entry = {
           key: normalized,
-          text: det.plate_text,           // displayed text (not normalized)
+          plate_id: det.plate_id || null,
+          text: det.plate_text,
           confidence: det.confidence,
           ocr_confidence: det.ocr_confidence ?? 0,
           firstSeen: new Date(),
           thumbUrl,
         };
         state.plates.unshift(entry);
-        state.platesByKey[normalized] = 0;  // index will be wrong after more inserts; we re-index in renderPlates
+        state.platesByKey[normalized] = 0;
         renderPlates();
       });
   } else {
-    // Existing plate — keep the highest-confidence reading
-    const idx = state.plates.findIndex((p) => p.key === matchKey);
-    if (idx === -1) return;
-    const existing = state.plates[idx];
+    // Existing plate — update if better confidence, attach plate_id if new
+    const existing = state.plates[matchedIdx];
+    if (det.plate_id && !existing.plate_id) {
+      existing.plate_id = det.plate_id;
+    }
     const newConf = det.ocr_confidence ?? 0;
     if (newConf > (existing.ocr_confidence ?? 0)) {
       existing.text = det.plate_text;
       existing.ocr_confidence = newConf;
       existing.confidence = det.confidence;
-      // Update thumbnail too — better confidence read often means closer/clearer plate
       cropPlateThumb(frameBlob, det.box, result.image_width, result.image_height)
         .then((thumbUrl) => {
           if (existing.thumbUrl) URL.revokeObjectURL(existing.thumbUrl);
@@ -661,13 +709,17 @@ async function sendFrameAnpr(blob, sourceLabel) {
   const fd = new FormData();
   fd.append('image', blob, 'frame.jpg');
   fd.append('run_ocr', 'true');
-  // Always request debug info from backend so we can surface it in the console
-  // if needed (without the user having to restart anything).
   if (window.APERTURE_DEBUG_ANPR) {
     fd.append('debug', 'true');
   }
   fd.append('source_type', sourceLabel || 'frame');
-  fd.append('source_id', 'aperture-frontend');
+  // For still images, use a unique source_id per analysis so each image is
+  // processed with a fresh tracker state. For video sources, all frames in
+  // the stream share one source_id so trackers persist across frames.
+  const sourceId = (sourceLabel === 'image' || sourceLabel === 'file')
+    ? `image-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    : `aperture-${sourceLabel || 'default'}`;
+  fd.append('source_id', sourceId);
 
   try {
     const r = await fetch(`${state.apiUrl}/detect`, {
@@ -699,7 +751,7 @@ function handleDetectionResult(result, sourceLabel, frameBlob) {
   // For each detection that has a plate_text, attempt to dedupe and add to log
   for (const det of result.detections || []) {
     if (!det.plate_text) continue;
-    addOrUpdatePlate(det, frameBlob, result);
+    addOrUpdatePlate(det, frameBlob, result, sourceLabel);
   }
 }
 
