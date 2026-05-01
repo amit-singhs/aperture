@@ -152,10 +152,20 @@
         <div class="control-grid">
           <div class="field">
             <label for="webcamFacing">camera</label>
-            <select id="webcamFacing">
-              <option value="user">front</option>
-              <option value="environment">back</option>
-            </select>
+            <div class="camera-picker">
+              <select id="webcamFacing">
+                <option value="user">front-facing</option>
+                <option value="environment">back-facing</option>
+              </select>
+              <button type="button" class="btn-flip" id="flipCamera" disabled aria-label="flip camera" title="flip camera">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M14 4l3 3-3 3"/>
+                  <path d="M17 7H7a4 4 0 0 0-4 4v1"/>
+                  <path d="M10 20l-3-3 3-3"/>
+                  <path d="M7 17h10a4 4 0 0 0 4-4v-1"/>
+                </svg>
+              </button>
+            </div>
           </div>
           <div class="field">
             <label for="webcamInterval">sample interval · <span id="webcamIntervalLabel">3s</span></label>

@@ -84,31 +84,42 @@ async function testConnection() {
   if (!url) { flashHint('enter API URL first', 'error'); return; }
 
   setConnState('loading', 'connecting…');
+
+  // Step 1: /health — this is the real "is the backend reachable" test.
+  let healthData;
   try {
     const r = await fetch(`${url}/health`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = await r.json();
-
-    let label = 'connected';
-    if (d.gpu) label = `${d.gpu.name.toLowerCase()}`;
-    setConnState('ok', label);
-
-    // Then check /ready
-    const r2 = await fetch(`${url}/ready`);
-    if (r2.ok) {
-      const d2 = await r2.json();
-      flashHint(`ready · model ${d2.model_vram_gb.toFixed(1)} GB · ${d.gpu.vram_total_gb.toFixed(0)} GB total`, 'ok');
-      $('docsLink').href = `${url}/docs`;
-      $('statBackend').textContent = (d.gpu?.name || 'connected').toLowerCase();
-      startStatsPolling();
-    } else {
-      flashHint('connected, but model still loading…', 'info');
-    }
+    healthData = await r.json();
   } catch (e) {
     setConnState('error', 'unreachable');
     flashHint(`error: ${e.message}`, 'error');
     stopStatsPolling();
+    return;
   }
+
+  // Health passed. Backend is reachable — pill is GREEN regardless of what /ready says.
+  const gpuName = healthData.gpu?.name?.toLowerCase() || 'connected';
+  setConnState('ok', gpuName);
+  $('docsLink').href = `${url}/docs`;
+  $('statBackend').textContent = gpuName;
+
+  // Step 2: /ready — best-effort. Failure here means model still loading,
+  // not that the connection is broken. Pill stays green.
+  try {
+    const r2 = await fetch(`${url}/ready`);
+    if (r2.ok) {
+      const d2 = await r2.json();
+      const vramTotal = healthData.gpu?.vram_total_gb?.toFixed(0) ?? '?';
+      flashHint(`ready · model ${d2.model_vram_gb.toFixed(1)} GB · ${vramTotal} GB total`, 'ok');
+    } else {
+      flashHint('connected · model still loading…', 'info');
+    }
+  } catch (e) {
+    flashHint('connected · /ready endpoint not responding', 'info');
+  }
+
+  startStatsPolling();
 }
 
 // ---------- stats polling ----------
@@ -124,8 +135,17 @@ async function pollStats() {
   if (!state.apiUrl) return;
   try {
     const r = await fetch(`${state.apiUrl}/stats`, { headers: authHeaders() });
-    if (!r.ok) return;
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
+
+    // Connection is alive — make sure the pill reflects that.
+    // (handles the case where it was previously in 'error' due to a transient failure)
+    const pill = $('connStatus');
+    if (pill.dataset.state !== 'ok') {
+      const gpuName = $('statBackend').textContent || 'connected';
+      setConnState('ok', gpuName);
+    }
+
     $('statUptime').textContent = formatUptime(d.uptime_seconds);
     $('statRequests').textContent = `${d.requests_succeeded}/${d.requests_failed}`;
     $('statLatency').textContent = d.average_inference_seconds
@@ -134,7 +154,10 @@ async function pollStats() {
     if (d.vram_allocated_gb != null) {
       $('statVram').textContent = `${d.vram_allocated_gb.toFixed(1)} GB`;
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) {
+    // Backend lost — flip the pill so the user knows
+    setConnState('error', 'lost connection');
+  }
 }
 function formatUptime(s) {
   s = Math.floor(s);
@@ -245,10 +268,17 @@ async function sendFrame(blob, sourceLabel, prompt) {
 
 function videoToBlob(videoEl) {
   return new Promise((resolve) => {
+    const w = videoEl.videoWidth;
+    const h = videoEl.videoHeight;
+    if (!w || !h) {
+      // Video isn't ready — return null and let the caller decide what to do
+      resolve(null);
+      return;
+    }
     const canvas = $('frameCanvas');
-    canvas.width = videoEl.videoWidth || 1280;
-    canvas.height = videoEl.videoHeight || 720;
-    canvas.getContext('2d').drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(videoEl, 0, 0, w, h);
     canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.85);
   });
 }
@@ -371,52 +401,195 @@ function initWebcamTab() {
   const intervalLabel = $('webcamIntervalLabel');
   const intervalDisplay = $('webcamIntervalDisplay');
   const facing = $('webcamFacing');
+  const flipBtn = $('flipCamera');
 
   $('promptWebcam').value = DEFAULT_PROMPT;
+
+  // Track whether the active stream is producing usable frames.
+  // 'videoWidth > 0' is the canonical "ready to draw to canvas" signal.
+  let videoReady = false;
 
   intervalSlider.addEventListener('input', () => {
     intervalLabel.textContent = `${intervalSlider.value}s`;
     intervalDisplay.textContent = intervalSlider.value;
   });
 
-  startBtn.onclick = async () => {
+  // ---- camera open helper ----
+  // Tries facing-mode preference, then falls back. iOS Safari sometimes ignores
+  // a soft 'environment' hint and gives the front cam — using `exact` is the fix.
+  async function openCamera(preferredFacing) {
+    const constraints = [
+      { video: { facingMode: { exact: preferredFacing }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+      { video: { facingMode: preferredFacing,            width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+      { video: { facingMode: preferredFacing }, audio: false },
+      { video: true, audio: false },
+    ];
+    let lastErr;
+    for (const c of constraints) {
+      try {
+        return await navigator.mediaDevices.getUserMedia(c);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error('could not open camera');
+  }
+
+  // Wait until the video element has real dimensions. Without this on mobile,
+  // capture-to-canvas produces a 0×0 image and the API returns 'empty payload'.
+  function waitForVideoReady(videoEl, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      if (videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+        resolve(); return;
+      }
+      const onReady = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (e) => {
+        cleanup();
+        reject(new Error('video element error'));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('video metadata timeout'));
+      }, timeoutMs);
+      function cleanup() {
+        clearTimeout(timer);
+        videoEl.removeEventListener('loadedmetadata', onReady);
+        videoEl.removeEventListener('canplay', onReady);
+        videoEl.removeEventListener('error', onError);
+      }
+      videoEl.addEventListener('loadedmetadata', onReady);
+      videoEl.addEventListener('canplay', onReady);
+      videoEl.addEventListener('error', onError);
+    });
+  }
+
+  async function startCamera() {
+    videoReady = false;
+    captureBtn.disabled = true;
+    loopBtn.disabled = true;
+    startBtn.disabled = true;
+    flipBtn.disabled = true;
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 }, height: { ideal: 720 },
-          facingMode: facing.value,
-        },
-        audio: false,
-      });
+      const stream = await openCamera(facing.value);
       state.webcamStream = stream;
       video.srcObject = stream;
+
+      // iOS specifically requires play() in response to a user gesture, even when muted+autoplay are set
+      try { await video.play(); } catch (e) { /* some browsers throw, video still plays */ }
+
+      await waitForVideoReady(video);
+      videoReady = true;
+
       empty.style.display = 'none';
-      startBtn.disabled = true;
       stopBtn.disabled = false;
       captureBtn.disabled = false;
       loopBtn.disabled = false;
+      flipBtn.disabled = false;
     } catch (e) {
       flashHint(`camera error: ${e.message}`, 'error');
+      videoReady = false;
+      startBtn.disabled = false;
+      // If a partial stream got opened, clean it up
+      if (state.webcamStream) {
+        state.webcamStream.getTracks().forEach(t => t.stop());
+        state.webcamStream = null;
+      }
+      video.srcObject = null;
     }
-  };
+  }
 
-  stopBtn.onclick = () => {
+  async function stopCamera() {
     if (state.webcamLoop) stopWebcamLoop();
     if (state.webcamStream) {
       state.webcamStream.getTracks().forEach(t => t.stop());
       state.webcamStream = null;
     }
     video.srcObject = null;
+    videoReady = false;
     empty.style.display = '';
     startBtn.disabled = false;
     stopBtn.disabled = true;
     captureBtn.disabled = true;
     loopBtn.disabled = true;
-  };
+    flipBtn.disabled = true;
+  }
+
+  // Flip front/back without stopping the loop — just swap the underlying stream
+  async function flipCamera() {
+    if (!state.webcamStream) return;
+    const wasLooping = !!state.webcamLoop;
+    if (wasLooping) stopWebcamLoop();
+
+    facing.value = facing.value === 'user' ? 'environment' : 'user';
+    flipBtn.disabled = true;
+
+    // Stop old tracks first — some mobile browsers can't open two cameras at once
+    state.webcamStream.getTracks().forEach(t => t.stop());
+    state.webcamStream = null;
+    videoReady = false;
+
+    try {
+      const stream = await openCamera(facing.value);
+      state.webcamStream = stream;
+      video.srcObject = stream;
+      try { await video.play(); } catch (e) { /* */ }
+      await waitForVideoReady(video);
+      videoReady = true;
+      flipBtn.disabled = false;
+      if (wasLooping) startWebcamLoop();
+    } catch (e) {
+      flashHint(`flip failed: ${e.message}`, 'error');
+      // Try to revert
+      facing.value = facing.value === 'user' ? 'environment' : 'user';
+      try {
+        state.webcamStream = await openCamera(facing.value);
+        video.srcObject = state.webcamStream;
+        await video.play();
+        await waitForVideoReady(video);
+        videoReady = true;
+      } catch (e2) {
+        // revert failed too — go back to idle state
+        await stopCamera();
+      }
+      flipBtn.disabled = false;
+    }
+  }
+
+  startBtn.onclick = startCamera;
+  stopBtn.onclick = stopCamera;
+  flipBtn.onclick = flipCamera;
+
+  // The dropdown is for desktop convenience; if the user picks from it BEFORE
+  // starting, it just sets the initial facing. If AFTER starting, we flip live.
+  facing.addEventListener('change', () => {
+    if (state.webcamStream) {
+      // Need to re-open with the new value — easiest path is flip-style
+      const targetFacing = facing.value;
+      if (
+        (targetFacing === 'user' && !flipBtn.dataset.currentlyBack) ||
+        (targetFacing === 'environment' && flipBtn.dataset.currentlyBack)
+      ) {
+        // already correct, no-op
+        return;
+      }
+      flipCamera();
+    }
+  });
 
   captureBtn.onclick = async () => {
-    if (!state.webcamStream) return;
+    if (!state.webcamStream || !videoReady) {
+      flashHint('camera not ready yet', 'info');
+      return;
+    }
     const blob = await videoToBlob(video);
+    if (!blob || blob.size < 1000) {
+      flashHint('frame capture failed — try again in a moment', 'error');
+      return;
+    }
     sendFrame(blob, 'webcam', $('promptWebcam').value);
   };
 
@@ -431,8 +604,9 @@ function initWebcamTab() {
     loopBtn.classList.add('is-active');
     loopBtn.textContent = 'stop auto-loop';
     const tick = async () => {
-      if (!state.webcamStream) return;
+      if (!state.webcamStream || !videoReady) return;
       const blob = await videoToBlob(video);
+      if (!blob || blob.size < 1000) return;  // silently skip bad frames
       sendFrame(blob, 'webcam', $('promptWebcam').value);
     };
     tick();
@@ -575,6 +749,10 @@ function initCctvTab() {
   captureBtn.onclick = async () => {
     if (!state.cctvStream) return;
     const blob = await videoToBlob(video);
+    if (!blob || blob.size < 1000) {
+      flashHint('frame capture failed — stream may not be ready', 'error');
+      return;
+    }
     sendFrame(blob, 'cctv', $('promptCctv').value);
   };
 
@@ -591,6 +769,7 @@ function initCctvTab() {
     const tick = async () => {
       if (!state.cctvStream) return;
       const blob = await videoToBlob(video);
+      if (!blob || blob.size < 1000) return;
       sendFrame(blob, 'cctv', $('promptCctv').value);
     };
     tick();
@@ -622,6 +801,13 @@ window.addEventListener('beforeunload', () => {
 // ============================================================
 // INIT
 // ============================================================
+
+// Best-effort detection: touch device + narrow viewport → mobile.
+// Used to pick a sensible default camera. The user can still flip.
+function isLikelyMobile() {
+  return ('ontouchstart' in window) && window.innerWidth <= 900;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   loadCreds();
   initTabs();
@@ -629,6 +815,11 @@ document.addEventListener('DOMContentLoaded', () => {
   initWebcamTab();
   initCctvTab();
   renderFeed();
+
+  // Default to back-facing camera on mobile (it's what users mean by "the camera")
+  if (isLikelyMobile()) {
+    $('webcamFacing').value = 'environment';
+  }
 
   $('testConn').addEventListener('click', testConnection);
   $('saveCreds').addEventListener('click', saveCreds);

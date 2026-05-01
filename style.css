@@ -342,6 +342,40 @@ select {
   cursor: pointer;
 }
 
+/* Camera picker: dropdown + flip button side-by-side */
+.camera-picker {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+.camera-picker select { flex: 1; min-width: 0; }
+.btn-flip {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  flex-shrink: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--text-mute);
+  cursor: pointer;
+  transition: all 0.18s var(--ease);
+}
+.btn-flip:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: rotate(180deg);
+}
+.btn-flip:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.btn-flip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
 /* ============================================================
    BUTTONS — distinctive, sharp
    ============================================================ */
