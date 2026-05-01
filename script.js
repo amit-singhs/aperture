@@ -278,18 +278,54 @@ function getOverlayTargets(sourceLabel) {
 
 // Draw the bounding boxes for a given source onto its overlay canvas.
 // `result` comes straight from /detect, with absolute pixel coords relative
-// to the original sent frame. We map those to display coordinates using the
-// known image_width / image_height.
+// to the original sent frame.
+//
+// Design note: for the image source, the displayed <img> may not fill the
+// dropzone (object-fit: contain + max-height). To get boxes in the right
+// place we resize+reposition the canvas to match the rendered image rect.
+// For video, the overlay covers the whole .video-frame (which the video
+// also fills via object-fit: contain), so we use computeContainRect there.
 function drawOverlayForSource(sourceLabel, result) {
   const { media, overlay } = getOverlayTargets(sourceLabel);
   if (!media || !overlay) return;
-  if (state.mode !== 'anpr') return;  // skip drawing if user switched modes mid-flight
+  if (state.mode !== 'anpr') return;
 
-  // Match the canvas pixel size to its display size, so 1 canvas pixel = 1 CSS pixel.
-  // This keeps text and lines crisp without manual DPR juggling.
-  const rect = overlay.getBoundingClientRect();
-  const cssW = Math.max(1, Math.round(rect.width));
-  const cssH = Math.max(1, Math.round(rect.height));
+  // For image source, sync the canvas position+size to the <img>'s actual
+  // rendered rectangle (post object-fit). This is the only way to get pixel
+  // coordinates aligned to the visible image rather than to its container.
+  let cssW, cssH;
+  if (sourceLabel === 'image' || sourceLabel === 'file') {
+    const img = media; // <img id="imagePreview">
+    if (img.hidden || !img.naturalWidth) {
+      const ctx = overlay.getContext('2d');
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      return;
+    }
+    // The displayed rect of the <img> within its parent (.dropzone)
+    const rect = img.getBoundingClientRect();
+    const parentRect = overlay.parentElement.getBoundingClientRect();
+    overlay.style.left = `${rect.left - parentRect.left}px`;
+    overlay.style.top = `${rect.top - parentRect.top}px`;
+    overlay.style.width = `${rect.width}px`;
+    overlay.style.height = `${rect.height}px`;
+    overlay.style.right = 'auto';
+    overlay.style.bottom = 'auto';
+    cssW = Math.max(1, Math.round(rect.width));
+    cssH = Math.max(1, Math.round(rect.height));
+  } else {
+    // For video sources, overlay covers the whole .video-frame which the
+    // video also fills via object-fit: contain. Computing the contain rect
+    // inside drawing handles letterboxing of the video frame.
+    overlay.style.left = '';
+    overlay.style.top = '';
+    overlay.style.width = '';
+    overlay.style.height = '';
+    const rect = overlay.getBoundingClientRect();
+    cssW = Math.max(1, Math.round(rect.width));
+    cssH = Math.max(1, Math.round(rect.height));
+  }
+
+  // Match canvas pixel size to its CSS size (1 canvas px = 1 CSS px)
   if (overlay.width !== cssW) overlay.width = cssW;
   if (overlay.height !== cssH) overlay.height = cssH;
 
@@ -298,11 +334,18 @@ function drawOverlayForSource(sourceLabel, result) {
 
   if (!result || !result.detections || !result.detections.length) return;
 
-  // Figure out the displayed rectangle of the underlying media inside its container.
-  // For <video> with object-fit: contain, we have to compute the letterbox bands manually.
-  const mediaRect = computeContainRect(
-    result.image_width, result.image_height, cssW, cssH
-  );
+  // For image: overlay is now exactly the size of the rendered <img>, so the
+  // mapping is a simple scale from the original image dimensions to display.
+  // For video: overlay covers the .video-frame; the video inside is letterboxed
+  // via object-fit, so we need computeContainRect to place boxes correctly.
+  let mediaRect;
+  if (sourceLabel === 'image' || sourceLabel === 'file') {
+    mediaRect = { x: 0, y: 0, w: cssW, h: cssH };
+  } else {
+    mediaRect = computeContainRect(
+      result.image_width, result.image_height, cssW, cssH
+    );
+  }
 
   const sx = mediaRect.w / result.image_width;
   const sy = mediaRect.h / result.image_height;
@@ -319,13 +362,13 @@ function drawOverlayForSource(sourceLabel, result) {
     const dh = (y2 - y1) * sy;
 
     // Box
-    ctx.strokeStyle = '#5eead4';   // accent
+    ctx.strokeStyle = '#5eead4';
     ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
     ctx.shadowBlur = 4;
     ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh);
     ctx.shadowBlur = 0;
 
-    // Corner brackets — gives the "tracking" feel
+    // Corner brackets
     const bracketLen = Math.min(14, Math.max(6, dw * 0.15));
     ctx.strokeStyle = '#5eead4';
     ctx.lineWidth = 3;
@@ -340,7 +383,6 @@ function drawOverlayForSource(sourceLabel, result) {
       const labelW = metrics.width + padding * 2;
       const labelH = 22;
       const labelX = dx;
-      // Place label above the box if there's room, otherwise inside the top
       const labelY = dy >= labelH ? dy - 2 : dy + labelH + 2;
 
       ctx.fillStyle = 'rgba(8, 9, 12, 0.92)';
@@ -877,6 +919,15 @@ function initImageTab() {
     empty.style.display = 'none';
     analyzeBtn.disabled = false;
     clearBtn.disabled = false;
+
+    // When the image finishes loading, re-position the overlay so any
+    // existing detections render in the right place. This also runs after
+    // window resize / orientation change since the rect changes.
+    preview.onload = () => {
+      if (state.lastDetections.image) {
+        drawOverlayForSource('image', state.lastDetections.image);
+      }
+    };
   }
 
   input.addEventListener('change', e => pickFile(e.target.files[0]));
