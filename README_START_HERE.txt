@@ -1,29 +1,50 @@
-ANPR YOLO Colab Backend + Frontend
+ANPR YOLO Colab Backend + Frontend v2
 ====================================
 
-Files:
-1. ANPR_YOLO_Backend_Colab.ipynb
-   - Upload this to Google Colab.
-   - Upload your trained best.pt when prompted.
-   - Add Colab secret named NGROK_AUTHTOKEN.
-   - Run all cells.
-   - Copy the printed ngrok URL.
+What changed in v2
+------------------
+1. Region-aware regex cleaning removes side/badge text like IND from OCR output.
+2. Frontend can send a region hint: AUTO, IN, UK, EU, US, CA, AU.
+3. Backend reuses OCR text for the same track for a few seconds, so moving vehicles can be processed faster.
+4. Frontend defaults to 5 FPS, JPEG quality 0.65, OCR every 3 frames, and max frame width 960.
 
-2. index.html
-3. app.js
-   - Keep both files in the same folder.
-   - Open index.html in a browser.
-   - Paste the ngrok backend URL.
-   - Start camera or use a direct CORS-enabled video URL.
+Recommended live settings
+-------------------------
+For moving vehicles:
+- FPS: 4 to 8
+- OCR every N frames: 3 to 5
+- Max frame width: 960 or 1280
+- JPEG quality: 0.60 to 0.75
+- Region hint: choose the country/region if known. Use AUTO only for mixed feeds.
 
-Important:
-- best.pt detects the plate location.
-- EasyOCR reads the plate number from the cropped plate.
-- The backend returns JSON containing box coordinates, plate text, and confidence.
-- Unique plates are tracked in memory for 2 hours per source_id.
-- Colab/ngrok is suitable for testing, not permanent production hosting.
+Important
+---------
+If the frontend sends only 1 frame per second, the backend cannot truly lock onto a fast vehicle between frames. The backend can only detect what it receives. For fast motion, increase FPS and reduce OCR frequency.
 
-Browser limitations:
-- YouTube cannot be frame-captured directly from normal browser JS because of cross-origin restrictions.
-- RTSP cannot be opened directly by browser JS. Use RTSP-to-WebRTC/HLS conversion, or process RTSP server-side.
-- Mobile camera requires HTTPS or localhost.
+Backend API
+-----------
+POST /detect_frame
+Form fields:
+- image: JPG/PNG frame
+- source_id: camera/source name
+- conf: YOLO confidence, e.g. 0.25
+- iou: YOLO IoU, e.g. 0.45
+- ocr_enabled: true/false
+- region_hint: AUTO, IN, UK, EU, US, CA, AU
+
+Main response fields:
+- detections[].box
+- detections[].plate_text
+- detections[].raw_ocr_text
+- detections[].detection_confidence
+- detections[].ocr_confidence
+- detections[].format_pattern
+- detections[].track_id
+- detections[].is_unique_within_2h
+
+Files
+-----
+1. ANPR_YOLO_Backend_Colab.ipynb  -> run in Google Colab
+2. index.html                     -> open in browser
+3. app.js                         -> frontend logic
+

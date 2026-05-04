@@ -135,14 +135,36 @@
     <label for="sourceId">Source ID</label>
     <input id="sourceId" value="camera-1" />
 
+    <label for="regionHint">Registration region hint</label>
+    <select id="regionHint">
+      <option value="AUTO" selected>AUTO - mixed countries</option>
+      <option value="IN">India</option>
+      <option value="UK">United Kingdom</option>
+      <option value="EU">Europe</option>
+      <option value="US">United States</option>
+      <option value="CA">Canada</option>
+      <option value="AU">Australia</option>
+    </select>
+
     <div class="row">
       <div>
         <label for="fps">Frames per second</label>
-        <input id="fps" type="number" min="0.2" max="10" step="0.2" value="1" />
+        <input id="fps" type="number" min="0.2" max="12" step="0.2" value="5" />
       </div>
       <div>
         <label for="jpegQuality">JPEG quality</label>
-        <input id="jpegQuality" type="number" min="0.3" max="1" step="0.05" value="0.75" />
+        <input id="jpegQuality" type="number" min="0.3" max="1" step="0.05" value="0.65" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="ocrEvery">OCR every N frames</label>
+        <input id="ocrEvery" type="number" min="1" max="20" step="1" value="3" />
+      </div>
+      <div>
+        <label for="maxFrameWidth">Max frame width</label>
+        <input id="maxFrameWidth" type="number" min="320" max="1920" step="80" value="960" />
       </div>
     </div>
 
@@ -169,7 +191,7 @@
     <button id="startVideoUrl" class="secondary">Start Direct Video URL</button>
 
     <div class="note">
-      Browser note: normal YouTube pages and RTSP URLs cannot be read directly by canvas JavaScript. Use camera or a direct CORS-enabled video stream here. For RTSP/YouTube, proxy or process frames server-side first.
+      Browser note: normal YouTube pages and RTSP URLs cannot be read directly by canvas JavaScript. Use camera or a direct CORS-enabled video stream here. For RTSP/YouTube, proxy or process frames server-side first. For moving vehicles, use 4-8 FPS and OCR every 3-5 frames to keep latency low.
     </div>
 
     <div id="status" class="status">Idle.</div>

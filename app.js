@@ -11,6 +11,7 @@ let timer = null;
 let inFlight = false;
 let lastDetections = [];
 let lastResponse = null;
+let frameSeq = 0;
 
 function setStatus(text, cls = "") {
   statusEl.className = "status " + cls;
@@ -117,8 +118,12 @@ function captureAndSendFrame() {
   if (inFlight) return; // skip frame if backend is still busy, keeps latency low
 
   try {
-    capture.width = video.videoWidth;
-    capture.height = video.videoHeight;
+    const maxW = Math.max(320, Number($("maxFrameWidth")?.value || 960));
+    const srcW = video.videoWidth;
+    const srcH = video.videoHeight;
+    const scale = Math.min(1, maxW / srcW);
+    capture.width = Math.round(srcW * scale);
+    capture.height = Math.round(srcH * scale);
     const ctx = capture.getContext("2d", { willReadFrequently: false });
     ctx.drawImage(video, 0, 0, capture.width, capture.height);
   } catch (err) {
@@ -132,12 +137,17 @@ function captureAndSendFrame() {
     inFlight = true;
     const t0 = performance.now();
 
+    frameSeq += 1;
+    const ocrEvery = Math.max(1, Number($("ocrEvery")?.value || 3));
+    const shouldOcr = frameSeq % ocrEvery === 1;
+
     const form = new FormData();
     form.append("image", blob, "frame.jpg");
     form.append("source_id", $("sourceId").value || "default");
     form.append("conf", $("conf").value || "0.25");
     form.append("iou", $("iou").value || "0.45");
-    form.append("ocr_enabled", "true");
+    form.append("ocr_enabled", shouldOcr ? "true" : "false");
+    form.append("region_hint", $("regionHint")?.value || "AUTO");
 
     try {
       const res = await fetch(`${backendUrl}/detect_frame`, {
@@ -152,7 +162,8 @@ function captureAndSendFrame() {
       lastDetections = data.detections || [];
       drawOverlay();
       renderPlates(data, roundTrip);
-      setStatus(`OK | backend ${data.processing_ms} ms | round trip ${roundTrip} ms | detections ${lastDetections.length}`, "ok");
+      const ocrUsed = lastDetections.filter(d => d.ocr_used_this_frame).length;
+      setStatus(`OK | backend ${data.processing_ms} ms | round trip ${roundTrip} ms | detections ${lastDetections.length} | OCR used ${ocrUsed}`, "ok");
     } catch (err) {
       setStatus("Request failed: " + err.message, "bad");
     } finally {
@@ -221,10 +232,13 @@ function renderPlates(data, roundTrip) {
   for (const det of detections) {
     const div = document.createElement("div");
     div.className = "plate";
+    const fmt = det.format_pattern ? ` | format: ${det.format_pattern}` : "";
+    const raw = det.raw_ocr_text ? `<div class="small">raw OCR: ${det.raw_ocr_text}</div>` : "";
     div.innerHTML = `
       <div><strong>${det.plate_text || "Unread"}</strong> ${det.is_unique_within_2h ? "<span class='ok'>NEW</span>" : "<span>seen</span>"}</div>
-      <div class="small">track: ${det.track_id} | det: ${det.detection_confidence} | OCR: ${det.ocr_confidence} | ${data.processing_ms} ms backend | ${roundTrip} ms total</div>
+      <div class="small">track: ${det.track_id} | det: ${det.detection_confidence} | OCR: ${det.ocr_confidence}${fmt} | ${data.processing_ms} ms backend | ${roundTrip} ms total</div>
       <div class="small">box: x=${det.box.x1}, y=${det.box.y1}, w=${det.box.w}, h=${det.box.h}</div>
+      ${raw}
     `;
     platesEl.appendChild(div);
   }
