@@ -49,6 +49,7 @@ const state = {
   selectedFile: null,
   selectedFileBitmap: null,  // ImageBitmap of last analyzed image, for overlay re-renders
   statsTimer: null,
+  captureSeq: 0,
 };
 
 // ---------- creds ----------
@@ -229,6 +230,7 @@ function renderFeed() {
     const inf = e.inference_seconds != null ? `${e.inference_seconds.toFixed(2)}s` : '—';
     const wait = e.queue_wait_seconds != null && e.queue_wait_seconds > 0.01
                   ? `· queued ${e.queue_wait_seconds.toFixed(2)}s` : '';
+    const cap = e.captureMeta ? formatCaptureMeta(e.captureMeta) : '';
     return `
       <article class="feed-item ${cls}${newestCls}">
         <header class="feed-item-head">
@@ -236,14 +238,23 @@ function renderFeed() {
           <span class="feed-item-source">${e.error ? 'error' : src}</span>
         </header>
         <div class="feed-item-body">${body}</div>
-        ${e.error ? '' : `
+        ${e.error ? (cap ? `<footer class="feed-item-foot"><span>${cap}</span></footer>` : '') : `
         <footer class="feed-item-foot">
           <span><span class="stat-key">inference</span> <span class="stat-val">${inf}</span></span>
           ${wait ? `<span><span class="stat-key">${wait}</span></span>` : ''}
+          ${cap ? `<span>${cap}</span>` : ''}
         </footer>`}
       </article>
     `;
   }).join('');
+}
+
+function formatCaptureMeta(meta) {
+  if (!meta) return '';
+  const sent = meta.capturedAt ? new Date(meta.capturedAt).toTimeString().slice(0, 8) : '—';
+  const vf = meta.presentedFrames != null ? ` · vf ${meta.presentedFrames}` : '';
+  const timeout = meta.frameTimedOut ? ' · wait timeout' : '';
+  return `<span class="stat-key">frame</span> <span class="stat-val">#${meta.id}</span> · ${escapeHtml(meta.hash)} · sent ${sent} · video ${Number(meta.videoTime || 0).toFixed(2)}s${vf}${timeout}`;
 }
 
 function escapeHtml(s) {
@@ -673,35 +684,45 @@ async function sendFrame(blob, sourceLabel, prompt) {
 }
 
 async function sendFrameDescribe(blob, sourceLabel, prompt) {
+  const meta = blob?._apertureMeta || null;
   const fd = new FormData();
-  fd.append('image', blob, 'frame.jpg');
+  const filename = meta ? `frame-${meta.id}-${meta.hash}.jpg` : 'frame.jpg';
+  fd.append('image', blob, filename);
   fd.append('prompt', prompt || DEFAULT_PROMPT);
   fd.append('source_type', sourceLabel || 'frame');
-  fd.append('source_id', 'aperture-frontend');
+  // Use a unique source_id per commentary request. This prevents any backend,
+  // proxy, or source-session cache from accidentally reusing a previous frame.
+  fd.append('source_id', meta ? `aperture-${sourceLabel || 'frame'}-${meta.id}-${meta.hash}` : `aperture-${Date.now()}`);
 
   try {
-    const r = await fetch(`${state.apiUrl}/describe`, {
+    const r = await fetch(`${state.apiUrl}/describe?capture=${encodeURIComponent(meta?.id || Date.now())}`, {
       method: 'POST',
       headers: authHeaders(),
       body: fd,
+      cache: 'no-store',
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) {
+      updateDiagResult(meta, false, d.detail || `HTTP ${r.status}`);
       pushFeed({
         description: d.detail || `HTTP ${r.status}`,
         source: sourceLabel,
         error: true,
+        captureMeta: meta,
       });
       return;
     }
+    updateDiagResult(meta, true, d);
     pushFeed({
       description: d.description,
       source: sourceLabel,
       inference_seconds: d.inference_seconds,
       queue_wait_seconds: d.queue_wait_seconds,
+      captureMeta: meta,
     });
   } catch (e) {
-    pushFeed({ description: `network error · ${e.message}`, source: sourceLabel, error: true });
+    updateDiagResult(meta, false, e.message);
+    pushFeed({ description: `network error · ${e.message}`, source: sourceLabel, error: true, captureMeta: meta });
   }
 }
 
@@ -756,21 +777,20 @@ function handleDetectionResult(result, sourceLabel, frameBlob) {
 }
 
 /* ============================================================
-   Frame capture — bulletproof version
+   Frame capture — Android-safe fresh-frame version
    ============================================================
-   Critical iOS Safari facts (that bit us):
-   - ImageCapture API is NOT available on iOS Safari at all.
-   - requestVideoFrameCallback is unreliable on iOS Safari — may fire once
-     at the first frame and then never again, hanging any code that awaits it.
-     (Documented widely; videojs ships an explicit iOS workaround.)
-   - Plain drawImage(video, ...) actually works fine on iOS Safari, AS LONG AS
-     the video is actively playing (currentTime advancing).
+   Important change for mobile browsers:
+   - For WEBCAM commentary we no longer use ImageCapture.grabFrame().
+     The sent JPEG is drawn from the live <video> element only after the
+     browser reports a newly presented video frame.
+   - requestVideoFrameCallback is used when available; it is designed for
+     per-video-frame work and gives presentedFrames/mediaTime metadata.
+   - Fallback is requestAnimationFrame + a short delay, so Firefox Android
+     still works.
+   - Every outgoing blob receives local metadata: capture id, wall-clock time,
+     video time, dimensions, byte size, and a tiny sampled frame hash.
 
-   So: detect iOS and skip the fancy APIs. Verify the video is alive via
-   currentTime advancement. If a capture path hangs, time it out so the
-   loop keeps running.
-
-   Public flag: window.APERTURE_DEBUG_CAPTURE = true — to print diagnostics. */
+   Public flag: window.APERTURE_DEBUG_CAPTURE = true — prints diagnostics. */
 
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
               (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -781,47 +801,21 @@ function debugCapture(...args) {
   }
 }
 
-// Cache the ImageCapture instance per stream — not used on iOS
-let _imageCaptureInstance = null;
-let _imageCaptureStream = null;
+// Legacy no-op kept so older stop/flip code paths do not break.
+function clearImageCaptureCache() {}
 
-function getImageCapture(stream) {
-  if (IS_IOS) return null;  // iOS Safari has no ImageCapture
-  if (!('ImageCapture' in window) || !stream) return null;
-  if (_imageCaptureStream === stream && _imageCaptureInstance) {
-    return _imageCaptureInstance;
-  }
-  const track = stream.getVideoTracks()[0];
-  if (!track) return null;
-  try {
-    _imageCaptureInstance = new ImageCapture(track);
-    _imageCaptureStream = stream;
-    return _imageCaptureInstance;
-  } catch (e) {
-    return null;
-  }
+const _lastFrameMarker = new WeakMap();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function clearImageCaptureCache() {
-  _imageCaptureInstance = null;
-  _imageCaptureStream = null;
-}
-
-// Keep a record of last currentTime so we can detect a stalled video
-const _lastCurrentTime = new WeakMap();
-
-function isVideoAdvancing(videoEl) {
-  const now = videoEl.currentTime;
-  const prev = _lastCurrentTime.get(videoEl);
-  _lastCurrentTime.set(videoEl, now);
-  if (prev === undefined) return true;     // first call
-  return now > prev;                       // strict: must have advanced
-}
-
-// Force the video to keep playing — call before each capture attempt.
-// On iOS Safari, video.play() returns a Promise that we can await.
-// Calling it on an already-playing video is a no-op.
 async function ensureVideoPlaying(videoEl) {
+  if (!videoEl) return;
+  videoEl.muted = true;
+  videoEl.playsInline = true;
+  videoEl.setAttribute('playsinline', '');
+  videoEl.setAttribute('webkit-playsinline', '');
   if (videoEl.paused || videoEl.ended) {
     try {
       await videoEl.play();
@@ -832,26 +826,125 @@ async function ensureVideoPlaying(videoEl) {
   }
 }
 
-// Wrap a Promise with a hard timeout — guarantees we never hang the loop.
 function withTimeout(promise, ms, label) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const t = setTimeout(() => {
       debugCapture(`timeout: ${label} (${ms}ms)`);
-      resolve(null);
+      resolve({ timedOut: true, label });
     }, ms);
     promise.then(
       (v) => { clearTimeout(t); resolve(v); },
-      (e) => { clearTimeout(t); debugCapture(`error in ${label}:`, e.message); resolve(null); }
+      (e) => { clearTimeout(t); debugCapture(`error in ${label}:`, e.message); resolve({ error: e.message, label }); }
     );
   });
 }
 
-// Synchronously draw the video element to canvas and produce a JPEG blob.
-// This deliberately reads the visible <video> element, not ImageCapture.
-// For mobile camera commentary this is crucial: a few mobile browsers can
-// keep returning an old ImageCapture frame while the preview itself is live.
-// drawImage(video, ...) captures what the user is actually seeing.
-function drawAndEncode(videoEl, quality = 0.85) {
+function frameMarkerFromMeta(videoEl, meta) {
+  if (meta && Number.isFinite(meta.presentedFrames)) {
+    return `${meta.presentedFrames}:${Number(meta.mediaTime || 0).toFixed(4)}`;
+  }
+  return `time:${Number(videoEl.currentTime || 0).toFixed(4)}:${performance.now().toFixed(1)}`;
+}
+
+function waitForNextPresentedFrame(videoEl, timeoutMs = 1200) {
+  if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) {
+    return Promise.resolve({ method: 'not-ready', timedOut: false });
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let callbackId = null;
+    let timerId = null;
+    const prev = _lastFrameMarker.get(videoEl);
+
+    function finish(info) {
+      if (settled) return;
+      settled = true;
+      if (timerId) clearTimeout(timerId);
+      if (callbackId != null && typeof videoEl.cancelVideoFrameCallback === 'function') {
+        try { videoEl.cancelVideoFrameCallback(callbackId); } catch (e) { /* ignore */ }
+      }
+      resolve(info);
+    }
+
+    timerId = setTimeout(() => {
+      debugCapture(`timeout: fresh video frame (${timeoutMs}ms)`);
+      finish({ method: 'timeout', timedOut: true, marker: prev || '' });
+    }, timeoutMs);
+
+    // Chrome Android and modern Firefox expose this. It is the cleanest signal
+    // that a new camera frame reached the compositor.
+    if (typeof videoEl.requestVideoFrameCallback === 'function') {
+      const onFrame = (_now, meta) => {
+        if (settled) return;
+        const marker = frameMarkerFromMeta(videoEl, meta);
+        if (!prev || marker !== prev) {
+          _lastFrameMarker.set(videoEl, marker);
+          finish({
+            method: 'requestVideoFrameCallback',
+            marker,
+            presentedFrames: meta.presentedFrames,
+            mediaTime: meta.mediaTime,
+            expectedDisplayTime: meta.expectedDisplayTime,
+            timedOut: false,
+          });
+          return;
+        }
+        callbackId = videoEl.requestVideoFrameCallback(onFrame);
+      };
+      callbackId = videoEl.requestVideoFrameCallback(onFrame);
+      return;
+    }
+
+    // Firefox/older-browser fallback: let the browser paint once, then draw.
+    const startTime = Number(videoEl.currentTime || 0);
+    const startedAt = performance.now();
+    const step = () => {
+      if (settled) return;
+      const nowTime = Number(videoEl.currentTime || 0);
+      if (nowTime !== startTime || performance.now() - startedAt > 180) {
+        const marker = `raf:${nowTime.toFixed(4)}:${performance.now().toFixed(1)}`;
+        _lastFrameMarker.set(videoEl, marker);
+        finish({ method: 'requestAnimationFrame', marker, mediaTime: nowTime, timedOut: false });
+        return;
+      }
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+}
+
+function sampleCanvasHash(ctx, w, h) {
+  // Lightweight visual fingerprint. Not cryptographic; it only tells us whether
+  // the sent pixels are changing across captures.
+  try {
+    let hash = 2166136261; // FNV-ish
+    const xs = [0.12, 0.28, 0.44, 0.60, 0.76, 0.92];
+    const ys = [0.18, 0.34, 0.50, 0.66, 0.82];
+    for (const yy of ys) {
+      for (const xx of xs) {
+        const x = Math.min(w - 1, Math.max(0, Math.floor(w * xx)));
+        const y = Math.min(h - 1, Math.max(0, Math.floor(h * yy)));
+        const data = ctx.getImageData(x, y, 1, 1).data;
+        for (let i = 0; i < 3; i++) {
+          hash ^= data[i];
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+      }
+    }
+    return hash.toString(16).padStart(8, '0');
+  } catch (e) {
+    return 'nohash';
+  }
+}
+
+function annotateCaptureBlob(blob, meta) {
+  if (!blob) return blob;
+  try { blob._apertureMeta = meta; } catch (e) { /* Blob may be non-extensible in unusual browsers */ }
+  return blob;
+}
+
+function drawAndEncode(videoEl, quality = 0.85, frameInfo = {}) {
   return new Promise((resolve) => {
     const w = videoEl.videoWidth;
     const h = videoEl.videoHeight;
@@ -860,71 +953,65 @@ function drawAndEncode(videoEl, quality = 0.85) {
       resolve(null);
       return;
     }
+
     const canvas = $('frameCanvas');
     canvas.width = w;
     canvas.height = h;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     ctx.clearRect(0, 0, w, h);
+
+    // The crucial line: capture the actual currently presented video frame.
     ctx.drawImage(videoEl, 0, 0, w, h);
+
+    const hash = sampleCanvasHash(ctx, w, h);
+    const id = ++state.captureSeq;
+    const meta = {
+      id,
+      hash,
+      width: w,
+      height: h,
+      capturedAt: Date.now(),
+      videoTime: Number(videoEl.currentTime || 0),
+      frameMethod: frameInfo.method || 'drawImage',
+      frameMarker: frameInfo.marker || '',
+      presentedFrames: frameInfo.presentedFrames ?? null,
+      frameTimedOut: !!frameInfo.timedOut,
+      source: videoEl.id || 'video',
+    };
+
     canvas.toBlob((b) => {
-      debugCapture(`encoded ${w}x${h}, blob.size=${b?.size}, currentTime=${videoEl.currentTime.toFixed(3)}`);
-      resolve(b);
+      if (b) meta.sizeBytes = b.size;
+      debugCapture(
+        `capture #${meta.id}: ${w}x${h}, ${(b?.size || 0)} bytes, hash=${hash}, ` +
+        `videoTime=${meta.videoTime.toFixed(3)}, method=${meta.frameMethod}, timedOut=${meta.frameTimedOut}`
+      );
+      resolve(annotateCaptureBlob(b, meta));
     }, 'image/jpeg', quality);
   });
 }
 
-// Wait briefly for the preview to advance before capture. This prevents the
-// auto-loop from sampling the exact same painted frame when a mobile browser
-// has just resumed/started the camera. It never blocks forever.
-async function waitForFreshVideoFrame(videoEl, timeoutMs = 900) {
-  const startTime = videoEl.currentTime || 0;
-
-  return await withTimeout(new Promise((resolve) => {
-    let frames = 0;
-    const check = () => {
-      frames += 1;
-
-      // HAVE_CURRENT_DATA = 2. If currentTime moved, we definitely have a new
-      // media frame. If it did not move after a couple of paints, continue
-      // anyway; some live streams report time oddly, but the canvas draw still
-      // reads the newest painted pixels.
-      if (videoEl.readyState >= 2 && videoEl.currentTime > startTime) {
-        resolve(true);
-        return;
-      }
-
-      if (frames >= 8 && videoEl.readyState >= 2) {
-        resolve(false);
-        return;
-      }
-
-      requestAnimationFrame(check);
-    };
-    requestAnimationFrame(check);
-  }), timeoutMs, 'waitForFreshVideoFrame');
-}
-
-// Public capture function — called from capture buttons & loops
 async function captureFrame(videoEl, stream, quality = 0.85) {
-  if (!videoEl.videoWidth || !videoEl.videoHeight) {
+  if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) {
     debugCapture('captureFrame: video has no dimensions');
     return null;
   }
 
-  // Always make sure the video is actually playing before we read a frame.
   await ensureVideoPlaying(videoEl);
 
-  const advancing = isVideoAdvancing(videoEl);
-  debugCapture(`captureFrame: iOS=${IS_IOS}, paused=${videoEl.paused}, advancing=${advancing}, currentTime=${videoEl.currentTime.toFixed(3)}`);
+  let frameInfo = await waitForNextPresentedFrame(videoEl, 1200);
 
-  // IMPORTANT FIX:
-  // Do NOT use ImageCapture.grabFrame() for the live webcam path. On some
-  // mobile browsers it can return a stale track frame while the <video>
-  // preview continues moving. The backend then receives the same early frame
-  // repeatedly. Drawing the live <video> element guarantees the JPEG matches
-  // what the user currently sees on screen.
-  await waitForFreshVideoFrame(videoEl);
-  return await withTimeout(drawAndEncode(videoEl, quality), 2000, 'drawAndEncode');
+  // If Android pauses compositor callbacks while the page is being touched or
+  // the browser is busy, kick playback once and wait briefly again. This avoids
+  // the old first-frame loop without hanging the sender.
+  if (frameInfo && frameInfo.timedOut) {
+    debugCapture('fresh frame wait timed out; nudging video.play() and retrying once');
+    await ensureVideoPlaying(videoEl);
+    await sleep(120);
+    const retry = await waitForNextPresentedFrame(videoEl, 700);
+    if (retry && !retry.timedOut) frameInfo = retry;
+  }
+
+  return await withTimeout(drawAndEncode(videoEl, quality, frameInfo || {}), 2200, 'drawAndEncode');
 }
 
 // ============================================================
@@ -1272,6 +1359,7 @@ function initWebcamTab() {
       flashHint('frame capture failed — try again in a moment', 'error');
       return;
     }
+    recordDiag(blob, blob._apertureMeta || null);
     sendFrame(blob, 'webcam', $('promptWebcam').value);
   };
 
@@ -1281,37 +1369,38 @@ function initWebcamTab() {
   };
 
   function startWebcamLoop() {
-    const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
     overlay.hidden = false;
     loopBtn.classList.add('is-active');
     loopBtn.textContent = 'stop auto-loop';
 
-    // Self-rescheduling loop: each tick waits for the previous send to FINISH
-    // before scheduling the next. This prevents requests from overlapping and
-    // means we always capture-then-send a fresh frame each cycle.
+    // Fixed cadence loop. If the backend is still processing the previous
+    // frame, we skip that tick rather than queue old frames. The next send is
+    // always captured fresh from the live camera.
     state.webcamLoopActive = true;
+    let inFlight = false;
 
     const tick = async () => {
       if (!state.webcamLoopActive) return;
-      const t0 = performance.now();
       try {
-        if (state.webcamStream && videoReady) {
+        if (inFlight) {
+          debugCapture('tick skipped: previous request still in flight');
+        } else if (state.webcamStream && videoReady) {
+          inFlight = true;
           const blob = await captureFrame(video, state.webcamStream);
           debugCapture(`tick: blob=${blob?.size ?? 'null'} bytes`);
           if (blob && blob.size > 1000) {
-            recordDiag(blob, video.currentTime, blob.size);
+            recordDiag(blob, blob._apertureMeta || null);
             await sendFrame(blob, 'webcam', $('promptWebcam').value);
           }
+          inFlight = false;
         }
       } catch (e) {
+        inFlight = false;
         debugCapture('tick error:', e.message);
       }
-      // Compute the wait so cycles stay close to `interval` regardless of inference time.
-      // If inference took longer than the interval, the next tick fires immediately.
       if (!state.webcamLoopActive) return;
-      const elapsed = performance.now() - t0;
-      const wait = Math.max(0, interval - elapsed);
-      state.webcamLoopTimer = setTimeout(tick, wait);
+      const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
+      state.webcamLoopTimer = setTimeout(tick, interval);
     };
     tick();
   }
@@ -1460,6 +1549,7 @@ function initCctvTab() {
       flashHint('frame capture failed — stream may not be ready', 'error');
       return;
     }
+    recordDiag(blob, blob._apertureMeta || null);
     sendFrame(blob, 'cctv', $('promptCctv').value);
   };
 
@@ -1469,31 +1559,34 @@ function initCctvTab() {
   };
 
   function startCctvLoop() {
-    const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
     overlay.hidden = false;
     loopBtn.classList.add('is-active');
     loopBtn.textContent = 'stop auto-loop';
 
     state.cctvLoopActive = true;
+    let inFlight = false;
 
     const tick = async () => {
       if (!state.cctvLoopActive) return;
-      const t0 = performance.now();
       try {
-        if (state.cctvStream) {
+        if (inFlight) {
+          debugCapture('cctv tick skipped: previous request still in flight');
+        } else if (state.cctvStream) {
+          inFlight = true;
           const blob = await captureFrame(video, null);
           if (blob && blob.size > 1000) {
-            recordDiag(blob, video.currentTime, blob.size);
+            recordDiag(blob, blob._apertureMeta || null);
             await sendFrame(blob, 'cctv', $('promptCctv').value);
           }
+          inFlight = false;
         }
       } catch (e) {
+        inFlight = false;
         debugCapture('cctv tick error:', e.message);
       }
       if (!state.cctvLoopActive) return;
-      const elapsed = performance.now() - t0;
-      const wait = Math.max(0, interval - elapsed);
-      state.cctvLoopTimer = setTimeout(tick, wait);
+      const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
+      state.cctvLoopTimer = setTimeout(tick, interval);
     };
     tick();
   }
@@ -1552,6 +1645,7 @@ const _diagState = {
 };
 
 function ensureDiagPanel() {
+  injectMobileFixStyles();
   if (_diagState.panel) return;
   const panel = document.createElement('aside');
   panel.id = 'diagPanel';
@@ -1569,7 +1663,17 @@ function ensureDiagPanel() {
   _diagState.countLabel = panel.querySelector('#diagCount');
 }
 
-function recordDiag(blob, currentTime, sizeBytes) {
+function recordDiag(blob, currentTimeOrMeta, sizeBytes) {
+  const meta = (currentTimeOrMeta && typeof currentTimeOrMeta === 'object')
+    ? currentTimeOrMeta
+    : (blob?._apertureMeta || {
+        id: ++state.captureSeq,
+        videoTime: Number(currentTimeOrMeta || 0),
+        sizeBytes: sizeBytes || blob?.size || 0,
+        capturedAt: Date.now(),
+        hash: 'legacy',
+      });
+
   if (!_diagState.enabled) return;
   ensureDiagPanel();
   _diagState.count += 1;
@@ -1578,24 +1682,233 @@ function recordDiag(blob, currentTime, sizeBytes) {
   const url = URL.createObjectURL(blob);
   const wrapper = document.createElement('div');
   wrapper.className = 'diag-thumb';
+  wrapper.dataset.captureId = String(meta.id || _diagState.count);
   wrapper.innerHTML = `
-    <img src="${url}" alt="">
+    <img src="${url}" alt="sent frame ${meta.id || _diagState.count}">
     <div class="diag-thumb-meta">
-      <span>#${_diagState.count}</span>
-      <span>${(sizeBytes / 1024).toFixed(0)}KB</span>
-      <span>t=${currentTime.toFixed(2)}s</span>
+      <span>#${meta.id || _diagState.count}</span>
+      <span>${((meta.sizeBytes || blob?.size || 0) / 1024).toFixed(0)}KB</span>
+      <span>v=${Number(meta.videoTime || 0).toFixed(2)}s</span>
+      <span>h=${escapeHtml(meta.hash || '—')}</span>
+      <span>${escapeHtml(meta.frameMethod || 'draw')}</span>
     </div>
+    <div class="diag-thumb-status">sent · waiting for API response…</div>
   `;
-  // Newest first
   _diagState.thumbList.insertBefore(wrapper, _diagState.thumbList.firstChild);
 
-  // Trim & free old object URLs
   while (_diagState.thumbList.children.length > _diagState.maxThumbs) {
     const old = _diagState.thumbList.lastChild;
     const oldImg = old.querySelector('img');
     if (oldImg) URL.revokeObjectURL(oldImg.src);
     old.remove();
   }
+}
+
+function updateDiagResult(meta, ok, result) {
+  if (!_diagState.enabled || !meta?.id) return;
+  const row = document.querySelector(`.diag-thumb[data-capture-id="${String(meta.id)}"]`);
+  if (!row) return;
+  const status = row.querySelector('.diag-thumb-status');
+  if (!status) return;
+  if (ok) {
+    const inf = result?.inference_seconds != null ? `${Number(result.inference_seconds).toFixed(2)}s` : 'done';
+    status.textContent = `API ok · inference ${inf}`;
+    status.dataset.state = 'ok';
+  } else {
+    status.textContent = `API error · ${String(result || 'failed').slice(0, 90)}`;
+    status.dataset.state = 'error';
+  }
+}
+
+
+// ============================================================
+// Mobile UI fixes: larger camera, locked sliders, debug toggle
+// ============================================================
+function injectMobileFixStyles() {
+  if (document.getElementById('apertureMobileFixStyles')) return;
+  const style = document.createElement('style');
+  style.id = 'apertureMobileFixStyles';
+  style.textContent = `
+    @media (max-width: 760px) {
+      .tabpanel[data-panel="webcam"] .video-frame {
+        height: 58vh !important;
+        min-height: 390px !important;
+        max-height: 620px !important;
+      }
+      .tabpanel[data-panel="webcam"] #webcamVideo {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: contain !important;
+      }
+      .tabpanel[data-panel="webcam"] .control-grid,
+      .tabpanel[data-panel="cctv"] .control-grid {
+        gap: 14px !important;
+      }
+      input[type="range"].aperture-range-locked {
+        pointer-events: none !important;
+        opacity: 0.58;
+      }
+      input[type="range"].aperture-range-unlocked {
+        pointer-events: auto !important;
+        opacity: 1;
+        outline: 2px solid rgba(94, 234, 212, 0.45);
+        outline-offset: 8px;
+        border-radius: 999px;
+      }
+      .interval-lock-controls {
+        display: grid;
+        grid-template-columns: 44px 1fr 44px;
+        gap: 8px;
+        align-items: center;
+        margin-top: 10px;
+      }
+      .interval-lock-controls button {
+        min-height: 40px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,.16);
+        background: rgba(255,255,255,.06);
+        color: inherit;
+        font: inherit;
+      }
+      .interval-lock-controls .unlock-range[data-unlocked="true"] {
+        border-color: rgba(94, 234, 212, .65);
+        color: #5eead4;
+      }
+      #diagPanel {
+        position: fixed;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        z-index: 9999;
+        max-height: 38vh;
+        overflow: auto;
+        padding: 10px;
+        border-radius: 18px;
+        background: rgba(8, 9, 12, 0.93);
+        backdrop-filter: blur(16px);
+        border: 1px solid rgba(255,255,255,.14);
+        box-shadow: 0 18px 60px rgba(0,0,0,.45);
+      }
+      .diag-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
+        font-weight: 700;
+      }
+      .diag-thumbs {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .diag-thumb {
+        overflow: hidden;
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(255,255,255,.04);
+      }
+      .diag-thumb img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+        background: #111;
+      }
+      .diag-thumb-meta,
+      .diag-thumb-status,
+      .diag-hint {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 6px;
+        font-size: 10px;
+        line-height: 1.25;
+        color: rgba(255,255,255,.74);
+      }
+      .diag-thumb-status[data-state="ok"] { color: #5eead4; }
+      .diag-thumb-status[data-state="error"] { color: #fb7185; }
+      .diag-hint { margin: 8px 0 0; }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function isTouchDevice() {
+  return ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+}
+
+function initIntervalSliderGuard(sliderId) {
+  const slider = $(sliderId);
+  if (!slider || slider.dataset.guardReady === '1' || !isTouchDevice()) return;
+  slider.dataset.guardReady = '1';
+
+  const controls = document.createElement('div');
+  controls.className = 'interval-lock-controls';
+  controls.innerHTML = `
+    <button type="button" class="range-minus" aria-label="decrease interval">−</button>
+    <button type="button" class="unlock-range" aria-label="unlock interval slider">unlock slider</button>
+    <button type="button" class="range-plus" aria-label="increase interval">+</button>
+  `;
+  slider.insertAdjacentElement('afterend', controls);
+
+  let relockTimer = null;
+  const unlockBtn = controls.querySelector('.unlock-range');
+  const min = Number(slider.min || 1);
+  const max = Number(slider.max || 30);
+  const step = Number(slider.step || 1);
+
+  function emitInput() {
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+    slider.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function setLocked(locked) {
+    slider.classList.toggle('aperture-range-locked', locked);
+    slider.classList.toggle('aperture-range-unlocked', !locked);
+    unlockBtn.dataset.unlocked = String(!locked);
+    unlockBtn.textContent = locked ? 'unlock slider' : 'slider unlocked';
+    if (relockTimer) clearTimeout(relockTimer);
+    if (!locked) {
+      relockTimer = setTimeout(() => setLocked(true), 7000);
+    }
+  }
+  function nudge(delta) {
+    const current = Number(slider.value || min);
+    slider.value = String(Math.max(min, Math.min(max, current + delta)));
+    emitInput();
+  }
+
+  controls.querySelector('.range-minus').addEventListener('click', () => nudge(-step));
+  controls.querySelector('.range-plus').addEventListener('click', () => nudge(step));
+  unlockBtn.addEventListener('click', () => setLocked(false));
+  slider.addEventListener('pointerup', () => setTimeout(() => setLocked(true), 250));
+  slider.addEventListener('change', () => setTimeout(() => setLocked(true), 250));
+  setLocked(true);
+}
+
+function addDebugToggleButton() {
+  if ($('toggleDebugFrames')) return;
+  const loopBtn = $('webcamLoopToggle');
+  if (!loopBtn) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.id = 'toggleDebugFrames';
+  btn.className = 'btn btn-ghost';
+  btn.textContent = _diagState.enabled ? 'hide sent frames' : 'debug sent frames';
+  btn.addEventListener('click', () => {
+    _diagState.enabled = !_diagState.enabled;
+    btn.textContent = _diagState.enabled ? 'hide sent frames' : 'debug sent frames';
+    if (_diagState.enabled) {
+      ensureDiagPanel();
+      flashHint('debug panel on: it shows the exact JPEGs sent to backend', 'ok');
+    } else if (_diagState.panel) {
+      _diagState.panel.remove();
+      _diagState.panel = null;
+      _diagState.thumbList = null;
+      _diagState.countLabel = null;
+    }
+  });
+  loopBtn.insertAdjacentElement('afterend', btn);
 }
 
 // ============================================================
@@ -1634,6 +1947,10 @@ document.addEventListener('DOMContentLoaded', () => {
   renderFeed();
   renderPlates();
   startOverlayLoop();
+  injectMobileFixStyles();
+  initIntervalSliderGuard('webcamInterval');
+  initIntervalSliderGuard('cctvInterval');
+  addDebugToggleButton();
 
   // Default to back-facing camera on mobile (it's what users mean by "the camera")
   if (isLikelyMobile()) {
