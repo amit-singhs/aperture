@@ -24,7 +24,17 @@ function escapeHtml(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
-function authHeaders() { return apiKey ? { 'X-API-Key': apiKey } : {}; }
+function authHeaders() {
+  const headers = {
+    'ngrok-skip-browser-warning': 'true',
+  };
+
+  if (state.apiKey) {
+    headers['X-API-Key'] = state.apiKey;
+  }
+
+  return headers;
+}
 function setStatus(state, text, detail) {
   $('relayStatus').dataset.state = state;
   $('relayStatus').textContent = text;

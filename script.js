@@ -96,7 +96,15 @@ function getApi() {
 }
 
 function authHeaders() {
-  return state.apiKey ? { 'X-API-Key': state.apiKey } : {};
+  const headers = {
+    'ngrok-skip-browser-warning': 'true',
+  };
+
+  if (apiKey) {
+    headers['X-API-Key'] = apiKey;
+  }
+
+  return headers;
 }
 
 function flashHint(msg, kind = 'info') {
