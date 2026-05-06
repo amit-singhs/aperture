@@ -1,6 +1,8 @@
 (() => {
 'use strict';
 
+window.APERTURE_COMMENTARY_VERSION = 'v5-ngrok-skip';
+
 const $ = (id) => document.getElementById(id);
 const LS_PREFIX = 'aperture.creds.v2';
 const COMMENTARY_SESSION_KEY = 'aperture.commentary.session.v1';
@@ -45,9 +47,10 @@ function withApiKeyQuery(rawUrl) {
   if (apiKey) u.searchParams.set('api_key', apiKey);
   return u.href;
 }
-function fetchHeaders() {
-  // This header bypasses ngrok's browser warning page. It is safe for this POC.
-  return { 'ngrok-skip-browser-warning': 'true' };
+function fetchHeaders(extra = {}) {
+  // Required for ngrok free tunnels. Without this, fetch() may receive
+  // ngrok's browser-warning HTML page instead of FastAPI JSON.
+  return { 'ngrok-skip-browser-warning': 'true', ...extra };
 }
 function loadInitial() {
   const params = new URLSearchParams(location.search);

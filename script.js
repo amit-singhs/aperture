@@ -5,6 +5,8 @@
 (() => {
 'use strict';
 
+window.APERTURE_FRONTEND_VERSION = 'v5-ngrok-skip';
+
 // ---------- helpers ----------
 const $ = (id) => document.getElementById(id);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -95,8 +97,14 @@ function getApi() {
   return { url: state.apiUrl, key: state.apiKey };
 }
 
+function ngrokHeaders(extra = {}) {
+  // Required for ngrok free tunnels. Without this, fetch() may receive
+  // ngrok's browser-warning HTML page instead of FastAPI JSON.
+  return { 'ngrok-skip-browser-warning': 'true', ...extra };
+}
+
 function authHeaders() {
-  const headers = { 'ngrok-skip-browser-warning': 'true' };
+  const headers = ngrokHeaders();
   if (state.apiKey) headers['X-API-Key'] = state.apiKey;
   return headers;
 }
@@ -209,7 +217,7 @@ function publishCommentaryEvent(entry) {
     const relayUrl = withApiKeyQuery(`${state.apiUrl}${COMMENTARY_RELAY_ENDPOINT}`);
     fetch(relayUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      headers: ngrokHeaders({ 'Content-Type': 'text/plain;charset=UTF-8' }),
       body: JSON.stringify(event),
       cache: 'no-store',
     }).catch(() => {
@@ -234,7 +242,7 @@ async function testConnection() {
   // Step 1: /health — this is the real "is the backend reachable" test.
   let healthData;
   try {
-    const r = await fetch(`${url}/health`);
+    const r = await fetch(`${url}/health`, { headers: ngrokHeaders(), cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     healthData = await r.json();
   } catch (e) {
@@ -253,7 +261,7 @@ async function testConnection() {
   // Step 2: /ready — best-effort. Failure here means model still loading,
   // not that the connection is broken. Pill stays green.
   try {
-    const r2 = await fetch(`${url}/ready`);
+    const r2 = await fetch(`${url}/ready`, { headers: ngrokHeaders(), cache: 'no-store' });
     if (r2.ok) {
       const d2 = await r2.json();
       const vramTotal = healthData.gpu?.vram_total_gb?.toFixed(0) ?? '?';
@@ -1630,7 +1638,7 @@ function initCctvTab() {
   async function waitForPlaylist(url, attempts) {
     for (let i = 0; i < attempts; i++) {
       try {
-        const r = await fetch(url, { method: 'HEAD' });
+        const r = await fetch(url, { method: 'HEAD', headers: ngrokHeaders(), cache: 'no-store' });
         if (r.ok) return true;
       } catch (e) { /* keep trying */ }
       await new Promise(r => setTimeout(r, 500));
@@ -1642,7 +1650,13 @@ function initCctvTab() {
     if (state.cctvHls) { state.cctvHls.destroy(); state.cctvHls = null; }
 
     if (window.Hls && window.Hls.isSupported()) {
-      const hls = new window.Hls({ liveDurationInfinity: true, lowLatencyMode: true });
+      const hls = new window.Hls({
+        liveDurationInfinity: true,
+        lowLatencyMode: true,
+        xhrSetup: (xhr) => {
+          xhr.setRequestHeader('ngrok-skip-browser-warning', 'true');
+        },
+      });
       hls.loadSource(playlistUrl);
       hls.attachMedia(video);
       hls.on(window.Hls.Events.ERROR, (_, data) => {
