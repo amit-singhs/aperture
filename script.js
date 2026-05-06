@@ -27,6 +27,13 @@ const LS_PREFIX = 'aperture.creds.v2';
 const LS_MODE = 'aperture.mode.v1';
 const MODES = ['describe', 'anpr'];
 
+// Commentary display is now a separate page. The mobile sender publishes each
+// completed /describe response to a named session; commentary.html reads it.
+const COMMENTARY_SESSION_KEY = 'aperture.commentary.session.v1';
+const COMMENTARY_LOCAL_PREFIX = 'aperture.commentary.feed.v1';
+const COMMENTARY_MAX_LOCAL = 50;
+const COMMENTARY_RELAY_ENDPOINT = '/commentary/publish';
+
 // ---------- state ----------
 const state = {
   mode: 'describe',   // 'describe' | 'anpr'
@@ -50,6 +57,8 @@ const state = {
   selectedFileBitmap: null,  // ImageBitmap of last analyzed image, for overlay re-renders
   statsTimer: null,
   captureSeq: 0,
+  commentarySession: null,
+  commentaryChannel: null,
 };
 
 // ---------- creds ----------
@@ -97,6 +106,106 @@ function flashHint(msg, kind = 'info') {
                 : kind === 'ok'    ? 'var(--accent)'
                                    : 'var(--text-mute)';
   setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000);
+}
+
+
+// ---------- commentary display session / relay ----------
+function makeSessionId() {
+  return Math.random().toString(36).slice(2, 7).toUpperCase() + '-' +
+         Math.random().toString(36).slice(2, 7).toUpperCase();
+}
+
+function getCommentarySession() {
+  if (state.commentarySession) return state.commentarySession;
+  const params = new URLSearchParams(location.search);
+  const fromUrl = params.get('session');
+  let session = fromUrl || '';
+  try {
+    session = session || localStorage.getItem(COMMENTARY_SESSION_KEY) || '';
+  } catch (e) { /* ignore */ }
+  if (!session) session = makeSessionId();
+  session = session.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || makeSessionId();
+  state.commentarySession = session;
+  try { localStorage.setItem(COMMENTARY_SESSION_KEY, session); } catch (e) { /* ignore */ }
+  return session;
+}
+
+function commentaryLocalKey(session = getCommentarySession()) {
+  return `${COMMENTARY_LOCAL_PREFIX}.${session}`;
+}
+
+function getCommentaryPageUrl() {
+  const session = getCommentarySession();
+  const url = new URL('commentary.html', location.href);
+  url.searchParams.set('session', session);
+  return url.href;
+}
+
+function initCommentarySenderUi() {
+  const session = getCommentarySession();
+  const codeEl = $('commentarySessionCode');
+  const linkEl = $('commentaryOpenLink');
+  const copyBtn = $('copyCommentaryLink');
+  if (codeEl) codeEl.textContent = session;
+  if (linkEl) linkEl.href = getCommentaryPageUrl();
+  if (copyBtn) {
+    copyBtn.onclick = async () => {
+      const url = getCommentaryPageUrl();
+      try {
+        await navigator.clipboard.writeText(url);
+        flashHint('commentary page link copied', 'ok');
+      } catch (e) {
+        flashHint('copy failed — open commentary.html and enter this session code', 'error');
+      }
+    };
+  }
+  if ('BroadcastChannel' in window && !state.commentaryChannel) {
+    state.commentaryChannel = new BroadcastChannel(`aperture-commentary-${session}`);
+  }
+}
+
+function saveCommentaryEventLocal(event) {
+  try {
+    const key = commentaryLocalKey(event.session_id);
+    const arr = JSON.parse(localStorage.getItem(key) || '[]');
+    arr.unshift(event);
+    if (arr.length > COMMENTARY_MAX_LOCAL) arr.length = COMMENTARY_MAX_LOCAL;
+    localStorage.setItem(key, JSON.stringify(arr));
+  } catch (e) { /* ignore */ }
+}
+
+function publishCommentaryEvent(entry) {
+  if (state.mode !== 'describe') return;
+  const sessionId = getCommentarySession();
+  const event = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    session_id: sessionId,
+    ts: new Date().toISOString(),
+    source: entry.source || 'frame',
+    description: entry.description || '',
+    error: !!entry.error,
+    inference_seconds: entry.inference_seconds ?? null,
+    queue_wait_seconds: entry.queue_wait_seconds ?? null,
+    capture_meta: entry.captureMeta || null,
+  };
+
+  // Same-browser fallback. Useful while developing, but different devices need
+  // the backend relay endpoints included in qwen_api_colab_v3_with_commentary_relay.ipynb.
+  saveCommentaryEventLocal(event);
+  try { state.commentaryChannel?.postMessage(event); } catch (e) { /* ignore */ }
+
+  // Cross-device path: mobile publishes to backend, laptop polls the backend.
+  if (state.apiUrl) {
+    fetch(`${state.apiUrl}${COMMENTARY_RELAY_ENDPOINT}`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+      cache: 'no-store',
+    }).catch(() => {
+      // Older backend notebooks won't have this endpoint. The camera page still works;
+      // commentary.html will show a clear relay warning until the backend patch is used.
+    });
+  }
 }
 
 // ---------- connection / health ----------
@@ -198,13 +307,15 @@ function formatUptime(s) {
 
 // ---------- feed (capped) ----------
 function pushFeed(entry) {
-  // entry: { description, source, inference_seconds, queue_wait_seconds, error }
-  state.feed.unshift({ ...entry, ts: new Date() });
+  // entry: { description, source, inference_seconds, queue_wait_seconds, error, captureMeta }
+  const fullEntry = { ...entry, ts: new Date() };
+  state.feed.unshift(fullEntry);
   if (state.feed.length > MAX_FEED) {
     // explicit free of old entries — keeps memory flat for long sessions
     state.feed.length = MAX_FEED;
   }
   renderFeed();
+  publishCommentaryEvent(fullEntry);
 }
 
 function renderFeed() {
@@ -1133,6 +1244,19 @@ function initImageTab() {
   };
 }
 
+
+function formatIntervalSeconds(sec) {
+  sec = Math.max(0, Number(sec || 0));
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
+
+function clampDescribeIntervalSeconds(raw) {
+  return Math.max(15, Math.min(300, parseInt(raw, 10) || 15));
+}
+
 // ============================================================
 // WEBCAM TAB
 // ============================================================
@@ -1156,10 +1280,14 @@ function initWebcamTab() {
   // 'videoWidth > 0' is the canonical "ready to draw to canvas" signal.
   let videoReady = false;
 
-  intervalSlider.addEventListener('input', () => {
-    intervalLabel.textContent = `${intervalSlider.value}s`;
-    intervalDisplay.textContent = intervalSlider.value;
-  });
+  function refreshWebcamIntervalLabel() {
+    const sec = clampDescribeIntervalSeconds(intervalSlider.value);
+    intervalSlider.value = String(sec);
+    intervalLabel.textContent = formatIntervalSeconds(sec);
+    intervalDisplay.textContent = formatIntervalSeconds(sec);
+  }
+  intervalSlider.addEventListener('input', refreshWebcamIntervalLabel);
+  refreshWebcamIntervalLabel();
 
   // ---- camera open helper ----
   // Tries facing-mode preference, then falls back. iOS Safari sometimes ignores
@@ -1399,7 +1527,7 @@ function initWebcamTab() {
         debugCapture('tick error:', e.message);
       }
       if (!state.webcamLoopActive) return;
-      const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
+      const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : clampDescribeIntervalSeconds(intervalSlider.value) * 1000;
       state.webcamLoopTimer = setTimeout(tick, interval);
     };
     tick();
@@ -1436,10 +1564,14 @@ function initCctvTab() {
 
   $('promptCctv').value = 'You are watching a live CCTV camera feed. Describe in detail what is happening — note any people, vehicles, activity, and notable changes from a static scene.';
 
-  intervalSlider.addEventListener('input', () => {
-    intervalLabel.textContent = `${intervalSlider.value}s`;
-    intervalDisplay.textContent = intervalSlider.value;
-  });
+  function refreshCctvIntervalLabel() {
+    const sec = clampDescribeIntervalSeconds(intervalSlider.value);
+    intervalSlider.value = String(sec);
+    intervalLabel.textContent = formatIntervalSeconds(sec);
+    intervalDisplay.textContent = formatIntervalSeconds(sec);
+  }
+  intervalSlider.addEventListener('input', refreshCctvIntervalLabel);
+  refreshCctvIntervalLabel();
 
   connectBtn.onclick = async () => {
     const rtspUrl = $('rtspUrl').value.trim();
@@ -1585,7 +1717,7 @@ function initCctvTab() {
         debugCapture('cctv tick error:', e.message);
       }
       if (!state.cctvLoopActive) return;
-      const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : Math.max(1, parseInt(intervalSlider.value, 10)) * 1000;
+      const interval = state.mode === "anpr" ? ANPR_SAMPLE_INTERVAL_MS : clampDescribeIntervalSeconds(intervalSlider.value) * 1000;
       state.cctvLoopTimer = setTimeout(tick, interval);
     };
     tick();
@@ -1729,16 +1861,54 @@ function injectMobileFixStyles() {
   const style = document.createElement('style');
   style.id = 'apertureMobileFixStyles';
   style.textContent = `
+    .commentary-relay-card .feed-list,
+    .commentary-relay-card .feed-empty {
+      display: none !important;
+    }
+    .commentary-link-box {
+      display: grid;
+      gap: 14px;
+      color: var(--text-mute);
+    }
+    .commentary-session-code {
+      display: inline-flex;
+      padding: 8px 10px;
+      border: 1px solid rgba(255,255,255,.15);
+      border-radius: 12px;
+      background: rgba(255,255,255,.05);
+      color: var(--text);
+      font-family: "Geist Mono", ui-monospace, monospace;
+      letter-spacing: .08em;
+    }
+    .commentary-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
     @media (max-width: 760px) {
       .tabpanel[data-panel="webcam"] .video-frame {
-        height: 58vh !important;
-        min-height: 390px !important;
-        max-height: 620px !important;
+        height: 70vh !important;
+        min-height: 470px !important;
+        max-height: 760px !important;
       }
       .tabpanel[data-panel="webcam"] #webcamVideo {
         width: 100% !important;
         height: 100% !important;
         object-fit: contain !important;
+      }
+      .commentary-relay-card .feed-list,
+      .commentary-relay-card .feed-empty {
+        display: none !important;
+      }
+      .commentary-actions {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+      .commentary-session-code {
+        font-family: "Geist Mono", ui-monospace, monospace;
+        letter-spacing: .08em;
+        word-break: break-word;
       }
       .tabpanel[data-panel="webcam"] .control-grid,
       .tabpanel[data-panel="cctv"] .control-grid {
@@ -1948,6 +2118,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderPlates();
   startOverlayLoop();
   injectMobileFixStyles();
+  initCommentarySenderUi();
   initIntervalSliderGuard('webcamInterval');
   initIntervalSliderGuard('cctvInterval');
   addDebugToggleButton();

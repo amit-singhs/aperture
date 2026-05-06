@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#08090c">
+  <title>Aperture · Commentary Screen</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08090c;
+      --panel: rgba(255,255,255,.07);
+      --panel-strong: rgba(255,255,255,.11);
+      --text: #f5f6fb;
+      --muted: rgba(245,246,251,.64);
+      --soft: rgba(245,246,251,.10);
+      --accent: #5eead4;
+      --error: #fb7185;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Geist, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(94,234,212,.14), transparent 34rem),
+        radial-gradient(circle at bottom right, rgba(168,85,247,.12), transparent 30rem),
+        var(--bg);
+      color: var(--text);
+    }
+    .commentary-page {
+      width: min(1120px, calc(100% - 28px));
+      margin: 0 auto;
+      padding: 28px 0 42px;
+    }
+    .commentary-hero {
+      display: grid;
+      grid-template-columns: 1.2fr .8fr;
+      gap: 18px;
+      align-items: end;
+      margin-bottom: 18px;
+    }
+    .eyebrow {
+      font-family: "Geist Mono", ui-monospace, monospace;
+      text-transform: uppercase;
+      letter-spacing: .18em;
+      font-size: 11px;
+      color: var(--accent);
+      margin: 0 0 10px;
+    }
+    h1 {
+      margin: 0;
+      font-family: Fraunces, Georgia, serif;
+      font-size: clamp(38px, 7vw, 86px);
+      line-height: .92;
+      font-weight: 500;
+      letter-spacing: -.04em;
+    }
+    .hero-sub {
+      margin: 14px 0 0;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.55;
+      max-width: 680px;
+    }
+    .status-card, .config-card, .feed-card {
+      border: 1px solid var(--soft);
+      border-radius: 24px;
+      background: linear-gradient(180deg, var(--panel-strong), var(--panel));
+      box-shadow: 0 20px 80px rgba(0,0,0,.25);
+      backdrop-filter: blur(14px);
+    }
+    .status-card {
+      padding: 18px;
+      align-self: stretch;
+      display: grid;
+      gap: 12px;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      width: fit-content;
+      padding: 8px 11px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.08);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .status-pill::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: currentColor;
+    }
+    .status-pill[data-state="ok"] { color: var(--accent); }
+    .status-pill[data-state="error"] { color: var(--error); }
+    .session-big {
+      font-family: "Geist Mono", ui-monospace, monospace;
+      font-size: clamp(22px, 3vw, 34px);
+      letter-spacing: .12em;
+      word-break: break-word;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: .92fr 1.08fr;
+      gap: 18px;
+      align-items: start;
+    }
+    .config-card { padding: 18px; display: grid; gap: 14px; }
+    .field { display: grid; gap: 7px; }
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .14em;
+      font-family: "Geist Mono", ui-monospace, monospace;
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--soft);
+      border-radius: 14px;
+      background: rgba(0,0,0,.28);
+      color: var(--text);
+      padding: 13px 14px;
+      font: inherit;
+      outline: none;
+    }
+    input:focus { border-color: rgba(94,234,212,.65); }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .btn {
+      border: 1px solid var(--soft);
+      border-radius: 999px;
+      padding: 11px 15px;
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn-primary { background: var(--accent); color: #04211d; border-color: transparent; font-weight: 700; }
+    .hint { color: var(--muted); line-height: 1.5; font-size: 14px; }
+    .feed-card { min-height: 60vh; overflow: hidden; }
+    .feed-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 12px;
+      padding: 18px 18px 0;
+    }
+    .feed-title { margin: 0; font-size: 18px; letter-spacing: -.02em; }
+    .feed-sub { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .feed-list { display: grid; gap: 12px; padding: 18px; }
+    .feed-empty {
+      min-height: 48vh;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      text-align: center;
+      padding: 24px;
+    }
+    .feed-item {
+      border: 1px solid var(--soft);
+      border-radius: 18px;
+      padding: 15px;
+      background: rgba(0,0,0,.20);
+    }
+    .feed-item.is-newest { border-color: rgba(94,234,212,.5); box-shadow: 0 0 0 1px rgba(94,234,212,.16) inset; }
+    .feed-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-family: "Geist Mono", ui-monospace, monospace;
+      margin-bottom: 10px;
+    }
+    .description { font-size: clamp(17px, 2vw, 22px); line-height: 1.55; }
+    .error .description { color: var(--error); }
+    @media (max-width: 840px) {
+      .commentary-hero, .grid { grid-template-columns: 1fr; }
+      .feed-card { min-height: 48vh; }
+    }
+  </style>
+</head>
+<body>
+  <main class="commentary-page">
+    <section class="commentary-hero">
+      <div>
+        <p class="eyebrow">aperture · commentary display</p>
+        <h1>Live descriptions,<br>off-camera.</h1>
+        <p class="hero-sub">Keep the phone on the scene. Open this page on the laptop and watch the Qwen responses arrive from the backend relay.</p>
+      </div>
+      <aside class="status-card">
+        <div id="relayStatus" class="status-pill" data-state="idle">not connected</div>
+        <div>
+          <label>session</label>
+          <div class="session-big" id="sessionReadout">—</div>
+        </div>
+        <div class="hint" id="statusDetail">Enter the same backend URL, API key, and session code used by the mobile camera page.</div>
+      </aside>
+    </section>
+
+    <section class="grid">
+      <aside class="config-card">
+        <div class="field">
+          <label for="apiUrl">API base URL</label>
+          <input id="apiUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://your-colab-ngrok-url.ngrok-free.app">
+        </div>
+        <div class="field">
+          <label for="apiKey">API key</label>
+          <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="same API_KEY secret">
+        </div>
+        <div class="field">
+          <label for="sessionId">commentary session</label>
+          <input id="sessionId" type="text" autocomplete="off" spellcheck="false" placeholder="example: A1BCD-Z9XYZ">
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="connectBtn" type="button">connect display</button>
+          <button class="btn" id="saveBtn" type="button">remember</button>
+          <button class="btn" id="clearBtn" type="button">clear feed</button>
+        </div>
+        <p class="hint">For a different device, the backend must include the commentary relay endpoints. Same-browser testing also works through local storage and BroadcastChannel.</p>
+      </aside>
+
+      <section class="feed-card">
+        <header class="feed-head">
+          <div>
+            <h2 class="feed-title">Descriptions</h2>
+            <p class="feed-sub"><span id="feedCount">0</span> received · newest first</p>
+          </div>
+        </header>
+        <div class="feed-list" id="feedList" aria-live="polite"></div>
+        <div class="feed-empty" id="feedEmpty">
+          <div>
+            <p>No commentary yet.</p>
+            <p class="hint">Start the camera loop on the mobile page. When Qwen responds, the text will appear here.</p>
+          </div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script src="commentary.js"></script>
+</body>
+</html>

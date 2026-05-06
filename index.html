@@ -156,7 +156,7 @@
           </div>
           <div class="video-overlay" id="webcamOverlay" hidden>
             <span class="overlay-dot"></span>
-            <span>live · sampling every <strong id="webcamIntervalDisplay">3</strong>s</span>
+            <span>live · sampling every <strong id="webcamIntervalDisplay">15s</strong></span>
           </div>
         </div>
 
@@ -184,8 +184,8 @@
             </div>
           </div>
           <div class="field">
-            <label for="webcamInterval">sample interval · <span id="webcamIntervalLabel">3s</span></label>
-            <input type="range" id="webcamInterval" min="1" max="30" value="3" step="1">
+            <label for="webcamInterval">sample interval · <span id="webcamIntervalLabel">15s</span></label>
+            <input type="range" id="webcamInterval" min="15" max="300" value="15" step="5">
           </div>
         </div>
 
@@ -236,7 +236,7 @@
           </div>
           <div class="video-overlay" id="cctvOverlay" hidden>
             <span class="overlay-dot"></span>
-            <span>live · cctv · sampling every <strong id="cctvIntervalDisplay">3</strong>s</span>
+            <span>live · cctv · sampling every <strong id="cctvIntervalDisplay">15s</strong></span>
           </div>
         </div>
 
@@ -247,8 +247,8 @@
 
         <div class="control-grid">
           <div class="field">
-            <label for="cctvInterval">sample interval · <span id="cctvIntervalLabel">3s</span></label>
-            <input type="range" id="cctvInterval" min="1" max="30" value="3" step="1">
+            <label for="cctvInterval">sample interval · <span id="cctvIntervalLabel">15s</span></label>
+            <input type="range" id="cctvInterval" min="15" max="300" value="15" step="5">
           </div>
         </div>
 
@@ -259,19 +259,29 @@
       </div>
     </div>
 
-    <!-- LIVE FEED -->
-    <aside class="panel panel-feed" data-mode-show="describe">
+    <!-- COMMENTARY DISPLAY: moved to a separate page -->
+    <aside class="panel panel-feed commentary-relay-card" data-mode-show="describe">
       <header class="feed-head">
         <div>
-          <h2 class="feed-title">descriptions</h2>
-          <p class="feed-sub"><span id="feedCount">0</span> · last 10 shown</p>
+          <h2 class="feed-title">commentary screen</h2>
+          <p class="feed-sub">open this on your laptop · session <span id="commentarySessionCode" class="commentary-session-code">—</span></p>
         </div>
-        <button type="button" class="btn btn-ghost btn-small" id="clearFeed">clear</button>
       </header>
-      <div class="feed-list" id="feedList" aria-live="polite"></div>
-      <div class="feed-empty" id="feedEmpty">
+
+      <div class="commentary-link-box">
+        <p>Descriptions are no longer shown beside the mobile camera. Keep this device pointed at the scene, and open the commentary page on another device using the same backend URL, API key, and session code.</p>
+        <div class="commentary-actions">
+          <a href="commentary.html" target="_blank" rel="noopener" class="btn btn-primary" id="commentaryOpenLink">open commentary page</a>
+          <button type="button" class="btn btn-ghost" id="copyCommentaryLink">copy commentary link</button>
+        </div>
+      </div>
+
+      <!-- Kept hidden so existing renderFeed/clearFeed code remains compatible. -->
+      <span id="feedCount" hidden>0</span>
+      <button type="button" id="clearFeed" hidden>clear</button>
+      <div class="feed-list" id="feedList" aria-live="polite" hidden></div>
+      <div class="feed-empty" id="feedEmpty" hidden>
         <p>no descriptions yet</p>
-        <p class="feed-empty-hint">submit a frame to begin</p>
       </div>
     </aside>
 
@@ -345,7 +355,7 @@
         <dl class="signoff-meta-list">
           <div>
             <dt>system</dt>
-            <dd>aperture · v10</dd>
+            <dd>aperture · v8</dd>
           </div>
           <div>
             <dt>vision model</dt>
