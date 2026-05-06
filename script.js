@@ -96,15 +96,15 @@ function getApi() {
 }
 
 function authHeaders() {
-  const headers = {
-    'ngrok-skip-browser-warning': 'true',
-  };
-
-  if (apiKey) {
-    headers['X-API-Key'] = apiKey;
-  }
-
+  const headers = { 'ngrok-skip-browser-warning': 'true' };
+  if (state.apiKey) headers['X-API-Key'] = state.apiKey;
   return headers;
+}
+
+function withApiKeyQuery(rawUrl) {
+  const u = new URL(rawUrl, location.href);
+  if (state.apiKey) u.searchParams.set('api_key', state.apiKey);
+  return u.href;
 }
 
 function flashHint(msg, kind = 'info') {
@@ -204,14 +204,16 @@ function publishCommentaryEvent(entry) {
 
   // Cross-device path: mobile publishes to backend, laptop polls the backend.
   if (state.apiUrl) {
-    fetch(`${state.apiUrl}${COMMENTARY_RELAY_ENDPOINT}`, {
+    // Use a simple text/plain POST plus api_key query param for the relay.
+    // This avoids CORS preflight problems on ngrok/free-browser tunnels.
+    const relayUrl = withApiKeyQuery(`${state.apiUrl}${COMMENTARY_RELAY_ENDPOINT}`);
+    fetch(relayUrl, {
       method: 'POST',
-      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
       body: JSON.stringify(event),
       cache: 'no-store',
     }).catch(() => {
-      // Older backend notebooks won't have this endpoint. The camera page still works;
-      // commentary.html will show a clear relay warning until the backend patch is used.
+      // The camera page still works even if the optional two-device relay is unreachable.
     });
   }
 }

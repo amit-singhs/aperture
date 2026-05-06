@@ -16,6 +16,13 @@ let channel = null;
 const eventsByKey = new Map();
 let events = [];
 
+window.addEventListener('error', (ev) => {
+  setStatus('error', 'page script error', `${ev.message || 'unknown error'}${ev.lineno ? ` at line ${ev.lineno}` : ''}`);
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  setStatus('error', 'page promise error', ev.reason?.message || String(ev.reason || 'unknown promise error'));
+});
+
 function lsKey() { return `${LS_PREFIX}.describe`; }
 function localFeedKey(session = sessionId) { return `${COMMENTARY_LOCAL_PREFIX}.${session}`; }
 function cleanSession(s) { return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40); }
@@ -24,21 +31,23 @@ function escapeHtml(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
-function authHeaders() {
-  const headers = {
-    'ngrok-skip-browser-warning': 'true',
-  };
-
-  if (state.apiKey) {
-    headers['X-API-Key'] = state.apiKey;
+function setStatus(stateName, text, detail) {
+  const status = $('relayStatus');
+  const detailEl = $('statusDetail');
+  if (status) {
+    status.dataset.state = stateName;
+    status.textContent = text;
   }
-
-  return headers;
+  if (detailEl && detail) detailEl.textContent = detail;
 }
-function setStatus(state, text, detail) {
-  $('relayStatus').dataset.state = state;
-  $('relayStatus').textContent = text;
-  if (detail) $('statusDetail').textContent = detail;
+function withApiKeyQuery(rawUrl) {
+  const u = new URL(rawUrl, location.href);
+  if (apiKey) u.searchParams.set('api_key', apiKey);
+  return u.href;
+}
+function fetchHeaders() {
+  // This header bypasses ngrok's browser warning page. It is safe for this POC.
+  return { 'ngrok-skip-browser-warning': 'true' };
 }
 function loadInitial() {
   const params = new URLSearchParams(location.search);
@@ -71,10 +80,23 @@ function setupChannel() {
     channel.onmessage = (ev) => addEvents([ev.data], 'browser');
   }
 }
-function eventKey(e) { return String(e.seq ?? e.id ?? `${e.ts}-${e.description?.slice(0, 20)}`); }
+function eventKey(e) {
+  return String(e.seq ?? e.id ?? e.request_id ?? `${e.created_at || e.server_ts || e.ts}-${String(e.description || '').slice(0, 20)}`);
+}
+function normalizeEvent(e) {
+  if (!e) return null;
+  const out = { ...e };
+  out.session_id = out.session_id || sessionId;
+  out.ts = out.ts || (out.created_at ? new Date(Number(out.created_at) * 1000).toISOString() : null) ||
+           (out.server_ts ? new Date(Number(out.server_ts) * 1000).toISOString() : new Date().toISOString());
+  out.source = out.source || out.source_type || 'webcam';
+  out.capture_meta = out.capture_meta || out.captureMeta || null;
+  return out;
+}
 function addEvents(newEvents, source) {
   let changed = false;
-  for (const e of newEvents || []) {
+  for (const raw of newEvents || []) {
+    const e = normalizeEvent(raw);
     if (!e || (e.session_id && e.session_id !== sessionId)) continue;
     const k = eventKey(e);
     if (eventsByKey.has(k)) continue;
@@ -84,7 +106,7 @@ function addEvents(newEvents, source) {
     changed = true;
   }
   if (!changed) return;
-  events.sort((a, b) => new Date(b.ts || b.server_ts || 0) - new Date(a.ts || a.server_ts || 0));
+  events.sort((a, b) => new Date(b.ts || 0) - new Date(a.ts || 0));
   if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
   render();
   setStatus('ok', source === 'backend' ? 'live via backend relay' : 'live locally', 'Receiving commentary events. Newest response appears at the top.');
@@ -96,32 +118,49 @@ function loadLocalEvents() {
     addEvents(arr, 'browser');
   } catch (e) { /* ignore */ }
 }
+async function testBackendHealth() {
+  if (!apiUrl) return false;
+  const url = withApiKeyQuery(`${apiUrl}/health`);
+  const r = await fetch(url, { headers: fetchHeaders(), cache: 'no-store' });
+  if (!r.ok) throw new Error(`/health HTTP ${r.status}`);
+  const text = await r.text();
+  if (text.trim().startsWith('<')) throw new Error('ngrok/browser warning page returned instead of backend JSON');
+  return true;
+}
 async function pollBackend() {
   if (!apiUrl || !sessionId) return;
   try {
     const url = new URL(`${apiUrl}/commentary/feed`);
     url.searchParams.set('session_id', sessionId);
     url.searchParams.set('after', String(lastSeq || 0));
-    const r = await fetch(url.href, { headers: authHeaders(), cache: 'no-store' });
+    if (apiKey) url.searchParams.set('api_key', apiKey);
+    const r = await fetch(url.href, { headers: fetchHeaders(), cache: 'no-store' });
     if (r.status === 404) {
-      setStatus('error', 'relay endpoint missing', 'Use the v3 backend notebook or paste the commentary relay patch into your Colab backend.');
+      setStatus('error', 'relay endpoint missing', 'Delete the old relay block, paste backend_commentary_relay_patch_v4.py into Colab, then restart the runtime/server.');
       return;
     }
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = await r.json();
-    addEvents(d.events || [], 'backend');
-    if (!(d.events || []).length && events.length === 0) {
+    const text = await r.text();
+    if (text.trim().startsWith('<')) throw new Error('ngrok/browser warning page returned instead of relay JSON');
+    const d = JSON.parse(text);
+    const incoming = d.events || d.items || [];
+    addEvents(incoming, 'backend');
+    if (Number.isFinite(Number(d.last_seq))) lastSeq = Math.max(lastSeq, Number(d.last_seq));
+    if (!incoming.length && events.length === 0) {
       setStatus('ok', 'connected · waiting', 'Backend relay is reachable. Start the camera loop on the mobile page.');
     }
   } catch (e) {
-    setStatus('error', 'relay not reachable', e.message);
+    setStatus('error', 'relay not reachable', e.message || String(e));
   }
 }
 function startPolling() {
   stopPolling();
   setupChannel();
   loadLocalEvents();
-  pollBackend();
+  setStatus('ok', 'checking backend…', 'Testing /health before polling the relay.');
+  testBackendHealth()
+    .then(() => pollBackend())
+    .catch((e) => setStatus('error', 'backend not reachable', e.message || String(e)));
   pollTimer = setInterval(() => {
     loadLocalEvents();
     pollBackend();
@@ -163,7 +202,10 @@ $('connectBtn').addEventListener('click', () => {
     setStatus('error', 'missing session', 'Enter the same session code shown on the mobile camera page.');
     return;
   }
-  setStatus('ok', 'connecting…', 'Checking browser cache and backend relay.');
+  if (!apiUrl) {
+    setStatus('error', 'missing backend URL', 'Enter the ngrok backend URL.');
+    return;
+  }
   startPolling();
 });
 $('saveBtn').addEventListener('click', () => {
