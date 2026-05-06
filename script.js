@@ -847,7 +847,10 @@ function withTimeout(promise, ms, label) {
 }
 
 // Synchronously draw the video element to canvas and produce a JPEG blob.
-// This is the path we use on iOS — boring and reliable.
+// This deliberately reads the visible <video> element, not ImageCapture.
+// For mobile camera commentary this is crucial: a few mobile browsers can
+// keep returning an old ImageCapture frame while the preview itself is live.
+// drawImage(video, ...) captures what the user is actually seeing.
 function drawAndEncode(videoEl, quality = 0.85) {
   return new Promise((resolve) => {
     const w = videoEl.videoWidth;
@@ -870,6 +873,37 @@ function drawAndEncode(videoEl, quality = 0.85) {
   });
 }
 
+// Wait briefly for the preview to advance before capture. This prevents the
+// auto-loop from sampling the exact same painted frame when a mobile browser
+// has just resumed/started the camera. It never blocks forever.
+async function waitForFreshVideoFrame(videoEl, timeoutMs = 900) {
+  const startTime = videoEl.currentTime || 0;
+
+  return await withTimeout(new Promise((resolve) => {
+    let frames = 0;
+    const check = () => {
+      frames += 1;
+
+      // HAVE_CURRENT_DATA = 2. If currentTime moved, we definitely have a new
+      // media frame. If it did not move after a couple of paints, continue
+      // anyway; some live streams report time oddly, but the canvas draw still
+      // reads the newest painted pixels.
+      if (videoEl.readyState >= 2 && videoEl.currentTime > startTime) {
+        resolve(true);
+        return;
+      }
+
+      if (frames >= 8 && videoEl.readyState >= 2) {
+        resolve(false);
+        return;
+      }
+
+      requestAnimationFrame(check);
+    };
+    requestAnimationFrame(check);
+  }), timeoutMs, 'waitForFreshVideoFrame');
+}
+
 // Public capture function — called from capture buttons & loops
 async function captureFrame(videoEl, stream, quality = 0.85) {
   if (!videoEl.videoWidth || !videoEl.videoHeight) {
@@ -877,37 +911,19 @@ async function captureFrame(videoEl, stream, quality = 0.85) {
     return null;
   }
 
-  // Always make sure the video is actually playing before we read a frame
+  // Always make sure the video is actually playing before we read a frame.
   await ensureVideoPlaying(videoEl);
 
   const advancing = isVideoAdvancing(videoEl);
   debugCapture(`captureFrame: iOS=${IS_IOS}, paused=${videoEl.paused}, advancing=${advancing}, currentTime=${videoEl.currentTime.toFixed(3)}`);
 
-  // On non-iOS, ImageCapture is the gold standard — bypass video element entirely
-  if (!IS_IOS) {
-    const ic = getImageCapture(stream);
-    if (ic) {
-      const blob = await withTimeout(
-        (async () => {
-          const bitmap = await ic.grabFrame();
-          const canvas = $('frameCanvas');
-          canvas.width = bitmap.width;
-          canvas.height = bitmap.height;
-          const ctx = canvas.getContext('2d');
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(bitmap, 0, 0);
-          bitmap.close?.();
-          return await new Promise((r) => canvas.toBlob(r, 'image/jpeg', quality));
-        })(),
-        2000,
-        'ImageCapture.grabFrame'
-      );
-      if (blob && blob.size > 1000) return blob;
-      // fall through to drawImage
-    }
-  }
-
-  // Universal path: just draw the video element. Works on iOS Safari, all browsers.
+  // IMPORTANT FIX:
+  // Do NOT use ImageCapture.grabFrame() for the live webcam path. On some
+  // mobile browsers it can return a stale track frame while the <video>
+  // preview continues moving. The backend then receives the same early frame
+  // repeatedly. Drawing the live <video> element guarantees the JPEG matches
+  // what the user currently sees on screen.
+  await waitForFreshVideoFrame(videoEl);
   return await withTimeout(drawAndEncode(videoEl, quality), 2000, 'drawAndEncode');
 }
 
